@@ -4,6 +4,10 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/hashicorp/go-hclog"
+	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/0xPolygon/polygon-edge/crypto"
 	"github.com/0xPolygon/polygon-edge/helper/hex"
 	"github.com/0xPolygon/polygon-edge/network"
@@ -13,9 +17,6 @@ import (
 	"github.com/0xPolygon/polygon-edge/secrets/hashicorpvault"
 	"github.com/0xPolygon/polygon-edge/secrets/local"
 	"github.com/0xPolygon/polygon-edge/types"
-	"github.com/hashicorp/go-hclog"
-	libp2pCrypto "github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 // SetupLocalSecretsManager is a helper method for boilerplate local secrets manager setup
@@ -158,7 +159,7 @@ func LoadValidatorAddress(secretsManager secrets.SecretsManager) (types.Address,
 	return crypto.PubKeyToAddress(&privateKey.PublicKey), nil
 }
 
-// LoadValidatorAddress loads BLS key by SecretsManager and returns BLS Public Key
+// LoadBLSPublicKey loads BLS key by SecretsManager and returns BLS Public Key
 func LoadBLSPublicKey(secretsManager secrets.SecretsManager) (string, error) {
 	if !secretsManager.HasSecret(secrets.ValidatorBLSKey) {
 		return "", nil
@@ -206,7 +207,7 @@ func LoadNodeID(secretsManager secrets.SecretsManager) (string, error) {
 	return nodeID.String(), nil
 }
 
-// GetCloudSecretsManager returns the cloud secrets manager from the provided config
+// InitCloudSecretsManager returns the cloud secrets manager from the provided config
 func InitCloudSecretsManager(secretsConfig *secrets.SecretsManagerConfig) (secrets.SecretsManager, error) {
 	var secretsManager secrets.SecretsManager
 

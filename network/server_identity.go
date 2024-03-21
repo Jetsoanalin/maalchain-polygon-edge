@@ -42,8 +42,6 @@ func (s *Server) AddPeer(id peer.ID, direction network.Direction) {
 
 	// Emit the event alerting listeners
 	// WARNING: THIS CALL IS POTENTIALLY BLOCKING
-	// UNDER HEAVY LOAD. IT SHOULD BE SUBSTITUTED
-	// WITH AN EVENT SYSTEM THAT ACTUALLY WORKS
 	s.emitEvent(id, peerEvent.PeerConnected)
 }
 
@@ -112,7 +110,7 @@ func (s *Server) setupIdentity() error {
 	identityService := identity.NewIdentityService(
 		s,
 		s.logger,
-		int64(s.config.Chain.Params.ChainID),
+		s.config.Chain.Params.ChainID,
 		s.host.ID(),
 	)
 

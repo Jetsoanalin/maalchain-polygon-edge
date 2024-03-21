@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xPolygon/polygon-edge/blockchain"
@@ -13,6 +14,7 @@ import (
 	"github.com/0xPolygon/polygon-edge/network/event"
 	"github.com/0xPolygon/polygon-edge/syncer/proto"
 	"github.com/0xPolygon/polygon-edge/types"
+	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-hclog"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -36,6 +38,11 @@ type syncPeerClient struct {
 	peerConnectionUpdateCh chan *event.PeerEvent   // peer connection update channel
 
 	shouldEmitBlocks bool // flag for emitting blocks in the topic
+	closeCh          chan struct{}
+	closed           atomic.Bool
+
+	peerStatusUpdateChLock   sync.Mutex
+	peerStatusUpdateChClosed bool
 }
 
 func NewSyncPeerClient(
@@ -51,11 +58,18 @@ func NewSyncPeerClient(
 		peerStatusUpdateCh:     make(chan *NoForkPeer, 1),
 		peerConnectionUpdateCh: make(chan *event.PeerEvent, 1),
 		shouldEmitBlocks:       true,
+		closeCh:                make(chan struct{}),
+
+		peerStatusUpdateChLock:   sync.Mutex{},
+		peerStatusUpdateChClosed: false,
 	}
 }
 
 // Start processes for SyncPeerClient
 func (m *syncPeerClient) Start() error {
+	// Mark client active.
+	m.closed.Store(false)
+
 	go m.startNewBlockProcess()
 	go m.startPeerEventProcess()
 
@@ -68,14 +82,29 @@ func (m *syncPeerClient) Start() error {
 
 // Close terminates running processes for SyncPeerClient
 func (m *syncPeerClient) Close() {
+	if m.closed.Swap(true) {
+		// Already closed.
+		return
+	}
+
+	if m.topic != nil {
+		m.topic.Close()
+	}
+
 	if m.subscription != nil {
-		m.subscription.Close()
+		m.blockchain.UnsubscribeEvents(m.subscription)
 
 		m.subscription = nil
 	}
 
+	if m.closeCh != nil {
+		close(m.closeCh)
+	}
+
+	m.peerStatusUpdateChLock.Lock()
+	m.peerStatusUpdateChClosed = true
 	close(m.peerStatusUpdateCh)
-	close(m.peerConnectionUpdateCh)
+	m.peerStatusUpdateChLock.Unlock()
 }
 
 // DisablePublishingPeerStatus disables publishing own status via gossip
@@ -132,6 +161,8 @@ func (m *syncPeerClient) GetConnectedPeerStatuses() []*NoForkPeer {
 			status, err := m.GetPeerStatus(peerID)
 			if err != nil {
 				m.logger.Warn("failed to get status from a peer, skip", "id", peerID, "err", err)
+
+				return //Skip appending nil status
 			}
 
 			syncPeersLock.Lock()
@@ -190,18 +221,32 @@ func (m *syncPeerClient) handleStatusUpdate(obj interface{}, from peer.ID) {
 		return
 	}
 
-	m.peerStatusUpdateCh <- &NoForkPeer{
-		ID:       from,
-		Number:   status.Number,
-		Distance: m.network.GetPeerDistance(from),
+	m.peerStatusUpdateChLock.Lock()
+	defer m.peerStatusUpdateChLock.Unlock()
+
+	if !m.peerStatusUpdateChClosed {
+		m.peerStatusUpdateCh <- &NoForkPeer{
+			ID:       from,
+			Number:   status.Number,
+			Distance: m.network.GetPeerDistance(from),
+		}
 	}
 }
 
 // startNewBlockProcess starts blockchain event subscription
 func (m *syncPeerClient) startNewBlockProcess() {
 	m.subscription = m.blockchain.SubscribeEvents()
+	eventCh := m.subscription.GetEventCh()
 
-	for event := range m.subscription.GetEventCh() {
+	for {
+		var event *blockchain.Event
+
+		select {
+		case <-m.closeCh:
+			return
+		case event = <-eventCh:
+		}
+
 		if !m.shouldEmitBlocks {
 			continue
 		}
@@ -220,6 +265,8 @@ func (m *syncPeerClient) startNewBlockProcess() {
 
 // startPeerEventProcess starts subscribing peer connection change events and process them
 func (m *syncPeerClient) startPeerEventProcess() {
+	defer close(m.peerConnectionUpdateCh)
+
 	peerEventCh, err := m.network.SubscribeCh(context.Background())
 	if err != nil {
 		m.logger.Error("failed to subscribe", "err", err)
@@ -227,9 +274,15 @@ func (m *syncPeerClient) startPeerEventProcess() {
 		return
 	}
 
-	for e := range peerEventCh {
-		if e.Type == event.PeerConnected || e.Type == event.PeerDisconnected {
-			m.peerConnectionUpdateCh <- e
+	for {
+		select {
+		case <-m.closeCh:
+			return
+
+		case e := <-peerEventCh:
+			if e != nil && (e.Type == event.PeerConnected || e.Type == event.PeerDisconnected) {
+				m.peerConnectionUpdateCh <- e
+			}
 		}
 	}
 }
@@ -330,6 +383,7 @@ func blockStreamToChannel(stream proto.SyncPeer_GetBlocksClient) (<-chan *types.
 			}
 
 			if err != nil {
+				metrics.IncrCounter([]string{syncerMetrics, "bad_message"}, 1)
 				errorCh <- err
 
 				break
@@ -337,10 +391,13 @@ func blockStreamToChannel(stream proto.SyncPeer_GetBlocksClient) (<-chan *types.
 
 			block, err := fromProto(protoBlock)
 			if err != nil {
+				metrics.IncrCounter([]string{syncerMetrics, "bad_block"}, 1)
 				errorCh <- err
 
 				break
 			}
+
+			metrics.SetGauge([]string{syncerMetrics, "ingress_bytes"}, float32(len(protoBlock.Block)))
 
 			blockCh <- block
 		}

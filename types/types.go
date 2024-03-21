@@ -1,7 +1,9 @@
 package types
 
 import (
+	"errors"
 	"fmt"
+	"math/big"
 	"strings"
 	"unicode"
 
@@ -9,12 +11,38 @@ import (
 	"github.com/0xPolygon/polygon-edge/helper/keccak"
 )
 
-var ZeroAddress = Address{}
-var ZeroHash = Hash{}
-
 const (
 	HashLength    = 32
 	AddressLength = 20
+
+	SignatureSize = 4
+)
+
+var (
+	// ZeroAddress is the default zero address
+	ZeroAddress = Address{}
+
+	// ZeroHash is the default zero hash
+	ZeroHash = Hash{}
+
+	// ZeroNonce is the default empty nonce
+	ZeroNonce = Nonce{}
+
+	// EmptyRootHash is the root when there are no transactions
+	EmptyRootHash = StringToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+
+	// EmptyUncleHash is the root when there are no uncles
+	EmptyUncleHash = StringToHash("0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347")
+
+	// EmptyCodeHash is the root where there is no code.
+	// Equivalent of: `types.BytesToHash(crypto.Keccak256(nil))`
+	EmptyCodeHash = StringToHash("0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+
+	// ErrTxTypeNotSupported denotes that transaction is not supported
+	ErrTxTypeNotSupported = errors.New("transaction type not supported")
+
+	// ErrInsufficientFunds denotes that account has insufficient funds for transaction execution
+	ErrInsufficientFunds = errors.New("insufficient funds for execution")
 )
 
 type Hash [HashLength]byte
@@ -86,11 +114,11 @@ func (a Address) Bytes() []byte {
 }
 
 func StringToHash(str string) Hash {
-	return BytesToHash(stringToBytes(str))
+	return BytesToHash(StringToBytes(str))
 }
 
 func StringToAddress(str string) Address {
-	return BytesToAddress(stringToBytes(str))
+	return BytesToAddress(StringToBytes(str))
 }
 
 func AddressToString(address Address) string {
@@ -108,7 +136,7 @@ func BytesToAddress(b []byte) Address {
 	return a
 }
 
-func stringToBytes(str string) []byte {
+func StringToBytes(str string) []byte {
 	str = strings.TrimPrefix(str, "0x")
 	if len(str)%2 == 1 {
 		str = "0" + str
@@ -119,16 +147,37 @@ func stringToBytes(str string) []byte {
 	return b
 }
 
+// IsValidAddress checks if provided string is a valid Ethereum address
+func IsValidAddress(address string) error {
+	// remove 0x prefix if it exists
+	if strings.HasPrefix(address, "0x") {
+		address = address[2:]
+	}
+
+	// decode the address
+	decodedAddress, err := hex.DecodeString(address)
+	if err != nil {
+		return fmt.Errorf("address %s contains invalid characters", address)
+	}
+
+	// check if the address has the correct length
+	if len(decodedAddress) != AddressLength {
+		return fmt.Errorf("address %s has invalid length", string(decodedAddress))
+	}
+
+	return nil
+}
+
 // UnmarshalText parses a hash in hex syntax.
 func (h *Hash) UnmarshalText(input []byte) error {
-	*h = BytesToHash(stringToBytes(string(input)))
+	*h = BytesToHash(StringToBytes(string(input)))
 
 	return nil
 }
 
 // UnmarshalText parses an address in hex syntax.
 func (a *Address) UnmarshalText(input []byte) error {
-	buf := stringToBytes(string(input))
+	buf := StringToBytes(string(input))
 	if len(buf) != AddressLength {
 		return fmt.Errorf("incorrect length")
 	}
@@ -146,10 +195,17 @@ func (a Address) MarshalText() ([]byte, error) {
 	return []byte(a.String()), nil
 }
 
-var (
-	// EmptyRootHash is the root when there are no transactions
-	EmptyRootHash = StringToHash("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+type Proof struct {
+	Data     []Hash // the proof himself
+	Metadata map[string]interface{}
+}
 
-	// EmptyUncleHash is the root when there are no uncles
-	EmptyUncleHash = StringToHash("0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347")
-)
+type OverrideAccount struct {
+	Nonce     *uint64
+	Code      []byte
+	Balance   *big.Int
+	State     map[Hash]Hash
+	StateDiff map[Hash]Hash
+}
+
+type StateOverride map[Address]OverrideAccount

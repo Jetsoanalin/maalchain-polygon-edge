@@ -174,8 +174,8 @@ func WaitUntilPeerDisconnectsFrom(ctx context.Context, srv *Server, ids ...peer.
 	return resVal, nil
 }
 
-// WaitUntilRoutingTableToBeAdded check routing table has given ids and retry by timeout
-func WaitUntilRoutingTableToBeFilled(ctx context.Context, srv *Server, size int) (bool, error) {
+// WaitUntilRoutingTableIsFilled check routing table has given ids and retry by timeout
+func WaitUntilRoutingTableIsFilled(ctx context.Context, srv *Server, size int) (bool, error) {
 	res, err := tests.RetryUntilTimeout(ctx, func() (interface{}, bool) {
 		if size == srv.discovery.RoutingTableSize() {
 			return true, false
@@ -340,9 +340,9 @@ func MeshJoin(servers ...*Server) []error {
 
 	var wg sync.WaitGroup
 
-	for indx := 0; indx < numServers; indx++ {
-		for innerIndx := 0; innerIndx < numServers; innerIndx++ {
-			if innerIndx > indx {
+	for sourceIdx := 0; sourceIdx < numServers; sourceIdx++ {
+		for destIdx := 0; destIdx < numServers; destIdx++ {
+			if destIdx > sourceIdx {
 				wg.Add(1)
 
 				go func(src, dest int) {
@@ -354,9 +354,9 @@ func MeshJoin(servers ...*Server) []error {
 						DefaultBufferTimeout,
 						DefaultJoinTimeout,
 					); joinErr != nil {
-						appendJoinError(fmt.Errorf("unable to join peers, %w", joinErr))
+						appendJoinError(fmt.Errorf("unable to join peers %d -> %d, %w", src, dest, joinErr))
 					}
-				}(indx, innerIndx)
+				}(sourceIdx, destIdx)
 			}
 		}
 	}
@@ -373,7 +373,7 @@ func GenerateTestLibp2pKey(t *testing.T) (crypto.PrivKey, string) {
 	assert.NoError(t, err)
 
 	// Instantiate the correct folder structure
-	setupErr := common.SetupDataDir(dir, []string{"libp2p"})
+	setupErr := common.SetupDataDir(dir, []string{"libp2p"}, 0770)
 	if setupErr != nil {
 		t.Fatalf("unable to generate libp2p folder structure, %v", setupErr)
 	}

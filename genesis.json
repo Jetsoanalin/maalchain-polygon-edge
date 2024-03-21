@@ -1,0 +1,49 @@
+{
+    "name": "Maal_Sharia_Chain",
+    "genesis": {
+        "nonce": "0x0000000000000000",
+        "timestamp": "0x0",
+        "extraData": "0x0000000000000000000000000000000000000000000000000000000000000000f901b7f901b0f846941d21ed157dca352a5526d1a3e1cd5f4f0db6aad0b0a7037b478aaaf4b0e7b143e5d15f521cd30d4d6218fba4556ef25de0518bd62b3ad6df3ad5830cbb8a455ab957ff00ecf8469482e26b5e5b93920693712a0dd3a26e5290ef6104b0ac0a18ce7c3b954ae37439b8e6c4c63b274a8f8f687a63f28e959e65df0dd9471b9708d2c278e57ba80d2f68cfce2773f846940f9faefbfdd9ebab95a4be0f8117f446b7f71648b08471e8cb867411884700bea97dcc9558cb83044ae86839eaff1e657ed29621ac5346b621014bff912e867732d18dfcf9f84694e8a8cffa639c78cdf8a5f9c5b643e4f4c4a1bb40b092900a88ea8a7446efbd958960dfe0efd7131e9f3bd297b18b1b6d8601ad9c113dfdc9c6621ace5c3dcb39df38ef2705f84694bfa8f59c162cc743c97b42b09ea9da21c07ab7e2b097f86534432b7289e23e15e339dc85a953456767832d288c590c80e148a49207413875051553fb7a8196e83bf56baa3ef84694ef90d243082bf561625e9d39749eeeeb278dc6bfb0a047c731c1369a392322cddb762c274f0d495b860fc3eaa50af80dbec4deec90a44ee46a178d44cbeb1ed6e58539f3f380c28080",
+        "gasLimit": "0x3b9aca00",
+        "difficulty": "0x1",
+        "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "coinbase": "0x0000000000000000000000000000000000000000",
+        "alloc": {
+            "0x6E1cB7109e200DD5e25EF9EC0d3a4baF1FfDd880": {
+                "balance": "0x204fce5e3e25026110000000"
+            }
+        },
+        "number": "0x0",
+        "gasUsed": "0x70000",
+        "parentHash": "0x0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "params": {
+        "forks": {
+            "homestead": 0,
+            "byzantium": 0,
+            "constantinople": 0,
+            "petersburg": 0,
+            "istanbul": 0,
+            "EIP150": 0,
+            "EIP158": 0,
+            "EIP155": 0
+        },
+        "chainID": 786,
+        "engine": {
+            "ibft": {
+                "epochSize": 100000,
+                "type": "PoA",
+                "validator_type": "bls"
+            }
+        },
+        "blockGasTarget": 0
+    },
+    "bootnodes": [
+        "/ip4/13.228.188.175/tcp/1401/p2p/16Uiu2HAm7Gaizck7ziuHyeFoEDZPKW91d4K5zfYd8d5QQ4MdpqW6",
+        "/ip4/13.228.188.175/tcp/1402/p2p/16Uiu2HAmCLmQ4jdY8WYdgNgZFUn18XUhTREwxvG21uvMGNSiD6VA",
+        "/ip4/13.229.38.155/tcp/1403/p2p/16Uiu2HAm3Dg75z1HFqwr3pYZL1PjgLv9uKZBbuaH8nGCwfrsA2jk",
+        "/ip4/13.229.38.155/tcp/1404/p2p/16Uiu2HAkxEeHJ3jMSF6STuSmg1n47Zq5nLKRuW7fVPRwZLbV8zVW",
+        "/ip4/54.255.187.204/tcp/1405/p2p/16Uiu2HAm8Rxy36oFTez8x9buFdcjyoCBDPWjKNJuJfYPy8g8qqiB",
+        "/ip4/54.255.187.204/tcp/1406/p2p/16Uiu2HAmQdaTQUY7iYCMPBUKUCpR3AVngSf4yadRX5XDGVcTJasd"
+    ]
+}

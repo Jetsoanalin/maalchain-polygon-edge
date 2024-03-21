@@ -70,7 +70,7 @@ func shuffleTxPoolEvents(
 	}
 
 	// Shuffle the events
-	mathRand.Seed(time.Now().UnixNano())
+	mathRand.Seed(time.Now().UTC().UnixNano())
 	mathRand.Shuffle(len(events), func(i, j int) {
 		events[i], events[j] = events[j], events[i]
 	})
@@ -141,7 +141,7 @@ func TestEventSubscription_ProcessedEvents(t *testing.T) {
 			}
 
 			wg.Wait()
-			eventWaitCtx, eventWaitFn := context.WithTimeout(context.Background(), time.Second*5)
+			eventWaitCtx, eventWaitFn := context.WithTimeout(context.Background(), 10*time.Second)
 			defer eventWaitFn()
 			if _, err := tests.RetryUntilTimeout(eventWaitCtx, func() (interface{}, bool) {
 				return nil, atomic.LoadInt64(&processed) < int64(testCase.expectedProcessed)

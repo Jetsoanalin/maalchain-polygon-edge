@@ -20,7 +20,7 @@ func BuildBlock(params BuildBlockParams) *types.Block {
 	if len(txs) == 0 {
 		header.TxRoot = types.EmptyRootHash
 	} else {
-		header.TxRoot = buildroot.CalculateTransactionsRoot(txs)
+		header.TxRoot = buildroot.CalculateTransactionsRoot(txs, header.Number)
 	}
 
 	if len(params.Receipts) == 0 {
@@ -29,7 +29,6 @@ func BuildBlock(params BuildBlockParams) *types.Block {
 		header.ReceiptsRoot = buildroot.CalculateReceiptsRoot(params.Receipts)
 	}
 
-	// TODO: Compute uncles
 	header.Sha3Uncles = types.EmptyUncleHash
 	header.ComputeHash()
 

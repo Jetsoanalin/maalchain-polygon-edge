@@ -8,6 +8,7 @@ import (
 
 	"github.com/0xPolygon/polygon-edge/command/server/config"
 
+	helperCommon "github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/network/common"
 
 	"github.com/0xPolygon/polygon-edge/chain"
@@ -15,11 +16,9 @@ import (
 	"github.com/0xPolygon/polygon-edge/network"
 	"github.com/0xPolygon/polygon-edge/secrets"
 	"github.com/0xPolygon/polygon-edge/server"
-	"github.com/0xPolygon/polygon-edge/types"
 )
 
 var (
-	errInvalidBlockTime       = errors.New("invalid block time specified")
 	errDataDirectoryUndefined = errors.New("data directory not defined")
 )
 
@@ -50,10 +49,6 @@ func (p *serverParams) initRawParams() error {
 		return err
 	}
 
-	if err := p.initBlockTime(); err != nil {
-		return err
-	}
-
 	if p.isDevMode {
 		p.initDevMode()
 	}
@@ -61,15 +56,9 @@ func (p *serverParams) initRawParams() error {
 	p.initPeerLimits()
 	p.initLogFileLocation()
 
+	p.relayer = p.rawConfig.Relayer
+
 	return p.initAddresses()
-}
-
-func (p *serverParams) initBlockTime() error {
-	if p.rawConfig.BlockTime < 1 {
-		return errInvalidBlockTime
-	}
-
-	return nil
 }
 
 func (p *serverParams) initDataDirLocation() error {
@@ -89,7 +78,7 @@ func (p *serverParams) initLogFileLocation() {
 func (p *serverParams) initBlockGasTarget() error {
 	var parseErr error
 
-	if p.blockGasTarget, parseErr = types.ParseUint64orHex(
+	if p.blockGasTarget, parseErr = helperCommon.ParseUint64orHex(
 		&p.rawConfig.BlockGasTarget,
 	); parseErr != nil {
 		return parseErr
@@ -204,7 +193,10 @@ func (p *serverParams) initUsingMaxPeers() {
 			float64(p.rawConfig.Network.MaxPeers) * network.DefaultDialRatio,
 		),
 	)
-	p.rawConfig.Network.MaxInboundPeers = p.rawConfig.Network.MaxPeers - p.rawConfig.Network.MaxOutboundPeers
+	// MaxPeers is expected to be greater than MaxOutboundPeers as long as DefaultDialRatio is less than 0
+	if p.rawConfig.Network.MaxPeers > p.rawConfig.Network.MaxOutboundPeers {
+		p.rawConfig.Network.MaxInboundPeers = p.rawConfig.Network.MaxPeers - p.rawConfig.Network.MaxOutboundPeers
+	}
 }
 
 func (p *serverParams) initAddresses() error {

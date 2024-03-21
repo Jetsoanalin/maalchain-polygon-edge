@@ -31,7 +31,7 @@ func (s serverType) String() string {
 	case serverWS:
 		return "ws"
 	default:
-		panic("BUG: Not expected")
+		panic("BUG: Not expected") //nolint:gocritic
 	}
 }
 
@@ -55,6 +55,7 @@ type JSONRPCStore interface {
 	networkStore
 	txPoolStore
 	filterManagerStore
+	bridgeStore
 	debugStore
 }
 
@@ -67,24 +68,34 @@ type Config struct {
 	PriceLimit               uint64
 	BatchLengthLimit         uint64
 	BlockRangeLimit          uint64
+
+	ConcurrentRequestsDebug uint64
+	WebSocketReadLimit      uint64
 }
 
 // NewJSONRPC returns the JSONRPC http server
 func NewJSONRPC(logger hclog.Logger, config *Config) (*JSONRPC, error) {
+	d, err := newDispatcher(
+		logger,
+		config.Store,
+		&dispatcherParams{
+			chainID:                 config.ChainID,
+			chainName:               config.ChainName,
+			priceLimit:              config.PriceLimit,
+			jsonRPCBatchLengthLimit: config.BatchLengthLimit,
+			blockRangeLimit:         config.BlockRangeLimit,
+			concurrentRequestsDebug: config.ConcurrentRequestsDebug,
+		},
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
 	srv := &JSONRPC{
-		logger: logger.Named("jsonrpc"),
-		config: config,
-		dispatcher: newDispatcher(
-			logger,
-			config.Store,
-			&dispatcherParams{
-				chainID:                 config.ChainID,
-				chainName:               config.ChainName,
-				priceLimit:              config.PriceLimit,
-				jsonRPCBatchLengthLimit: config.BatchLengthLimit,
-				blockRangeLimit:         config.BlockRangeLimit,
-			},
-		),
+		logger:     logger.Named("jsonrpc"),
+		config:     config,
+		dispatcher: d,
 	}
 
 	// start http server
@@ -212,6 +223,11 @@ func (j *JSONRPC) handleWs(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Set a read limit (maximum message size) for this connection
+	if j.config.WebSocketReadLimit != 0 {
+		ws.SetReadLimit(int64(j.config.WebSocketReadLimit))
+	}
+
 	// Defer WS closure
 	defer func(ws *websocket.Conn) {
 		err = ws.Close()
@@ -297,7 +313,6 @@ func (j *JSONRPC) handleJSONRPCRequest(w http.ResponseWriter, req *http.Request)
 	j.logger.Debug("handle", "request", string(data))
 
 	resp, err := j.dispatcher.Handle(data)
-
 	if err != nil {
 		_, _ = w.Write([]byte(err.Error()))
 	} else {

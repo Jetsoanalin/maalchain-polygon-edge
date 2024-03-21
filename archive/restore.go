@@ -19,11 +19,12 @@ const (
 
 type blockchainInterface interface {
 	SubscribeEvents() blockchain.Subscription
+	UnsubscribeEvents(blockchain.Subscription)
 	Genesis() types.Hash
 	GetBlockByNumber(uint64, bool) (*types.Block, bool)
 	GetHashByNumber(uint64) types.Hash
 	WriteBlock(*types.Block, string) error
-	VerifyFinalizedBlock(*types.Block) error
+	VerifyFinalizedBlock(*types.Block) (*types.FullBlock, error)
 }
 
 // RestoreChain reads blocks from the archive and write to the chain
@@ -68,9 +69,13 @@ func importBlocks(chain blockchainInterface, blockStream *blockStream, progressi
 	}
 
 	// Create a blockchain subscription for the sync progression and start tracking
-	progression.StartProgression(firstBlock.Number(), chain.SubscribeEvents())
+	subscription := chain.SubscribeEvents()
+	progression.StartProgression(firstBlock.Number(), subscription)
 	// Stop monitoring the sync progression upon exit
-	defer progression.StopProgression()
+	defer func() {
+		progression.StopProgression()
+		chain.UnsubscribeEvents(subscription)
+	}()
 
 	// Set the goal
 	progression.UpdateHighestProgression(metadata.Latest)
@@ -78,7 +83,7 @@ func importBlocks(chain blockchainInterface, blockStream *blockStream, progressi
 	nextBlock := firstBlock
 
 	for {
-		if err := chain.VerifyFinalizedBlock(nextBlock); err != nil {
+		if _, err := chain.VerifyFinalizedBlock(nextBlock); err != nil {
 			return err
 		}
 

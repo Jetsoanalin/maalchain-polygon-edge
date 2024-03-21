@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/0xPolygon/polygon-edge/blockchain"
+	"github.com/0xPolygon/polygon-edge/txpool/proto"
 	"github.com/0xPolygon/polygon-edge/types"
 )
 
@@ -44,11 +45,12 @@ type mockEvent struct {
 type mockStore struct {
 	JSONRPCStore
 
-	header       *types.Header
-	subscription *blockchain.MockSubscription
-	receiptsLock sync.Mutex
-	receipts     map[types.Hash][]*types.Receipt
-	accounts     map[types.Address]*Account
+	header        *types.Header
+	subscription  *blockchain.MockSubscription
+	txPoolChannel chan *proto.TxPoolEvent
+	receiptsLock  sync.Mutex
+	receipts      map[types.Hash][]*types.Receipt
+	accounts      map[types.Address]*Account
 
 	// headers is the list of historical headers
 	historicalHeaders []*types.Header
@@ -56,9 +58,10 @@ type mockStore struct {
 
 func newMockStore() *mockStore {
 	m := &mockStore{
-		header:       &types.Header{Number: 0},
-		subscription: blockchain.NewMockSubscription(),
-		accounts:     map[types.Address]*Account{},
+		header:        &types.Header{Number: 0},
+		subscription:  blockchain.NewMockSubscription(),
+		accounts:      map[types.Address]*Account{},
+		txPoolChannel: make(chan *proto.TxPoolEvent),
 	}
 	m.addHeader(m.header)
 
@@ -108,6 +111,15 @@ func (m *mockStore) emitEvent(evnt *mockEvent) {
 	m.subscription.Push(bEvnt)
 }
 
+func (m *mockStore) emitTxPoolEvent(eventType proto.EventType, txHash string) {
+	evt := &proto.TxPoolEvent{
+		Type:   eventType,
+		TxHash: txHash,
+	}
+
+	m.txPoolChannel <- evt
+}
+
 func (m *mockStore) GetAccount(root types.Hash, addr types.Address) (*Account, error) {
 	if acc, ok := m.accounts[addr]; ok {
 		return acc, nil
@@ -135,6 +147,14 @@ func (m *mockStore) GetReceiptsByHash(hash types.Hash) ([]*types.Receipt, error)
 
 func (m *mockStore) SubscribeEvents() blockchain.Subscription {
 	return m.subscription
+}
+
+func (m *mockStore) TxPoolSubscribe(request *proto.SubscribeRequest) (<-chan *proto.TxPoolEvent, func(), error) {
+	txPoolUnsubscribe := func() {
+		close(m.txPoolChannel)
+	}
+
+	return m.txPoolChannel, txPoolUnsubscribe, nil
 }
 
 func (m *mockStore) GetHeaderByNumber(num uint64) (*types.Header, bool) {
@@ -172,6 +192,31 @@ func (m *mockStore) GetCapacity() (uint64, uint64) {
 	return 0, 0
 }
 
+func (m *mockStore) GenerateExitProof(exitID uint64) (types.Proof, error) {
+	hash := types.BytesToHash([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+
+	return types.Proof{
+		Data: []types.Hash{hash},
+		Metadata: map[string]interface{}{
+			"LeafIndex": 1111111111111,
+		},
+	}, nil
+}
+
 func (m *mockStore) GetPeers() int {
 	return 20
+}
+
+func (m *mockStore) GetStateSyncProof(stateSyncID uint64) (types.Proof, error) {
+	hash := types.BytesToHash([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+	ssp := types.Proof{
+		Data:     []types.Hash{hash},
+		Metadata: map[string]interface{}{},
+	}
+
+	return ssp, nil
+}
+
+func (m *mockStore) FilterExtra(extra []byte) ([]byte, error) {
+	return extra, nil
 }

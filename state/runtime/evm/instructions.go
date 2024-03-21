@@ -3,12 +3,12 @@ package evm
 
 import (
 	"errors"
-	"fmt"
 	"math/big"
 	"math/bits"
 	"sync"
 
 	"github.com/0xPolygon/polygon-edge/crypto"
+	"github.com/0xPolygon/polygon-edge/helper/common"
 	"github.com/0xPolygon/polygon-edge/helper/keccak"
 	"github.com/0xPolygon/polygon-edge/state/runtime"
 	"github.com/0xPolygon/polygon-edge/types"
@@ -813,17 +813,19 @@ func opReturnDataCopy(c *state) {
 	dataOffset := c.pop()
 	length := c.pop()
 
-	if !c.allocateMemory(memOffset, length) {
-		return
-	}
-
 	if !dataOffset.IsUint64() {
-		c.exit(errGasUintOverflow)
+		c.exit(errReturnDataOutOfBounds)
 
 		return
 	}
 
-	if ulength := length.Uint64(); !c.consumeGas(((ulength + 31) / 32) * copyGas) {
+	// if length is 0, return immediately since no need for the data copying nor memory allocation
+	if length.Sign() == 0 || !c.allocateMemory(memOffset, length) {
+		return
+	}
+
+	ulength := length.Uint64()
+	if !c.consumeGas(((ulength + 31) / 32) * copyGas) {
 		return
 	}
 
@@ -842,7 +844,7 @@ func opReturnDataCopy(c *state) {
 	}
 
 	data := c.returnData[dataOffset.Uint64():dataEndIndex]
-	copy(c.memory[memOffset.Uint64():], data)
+	copy(c.memory[memOffset.Uint64():memOffset.Uint64()+ulength], data)
 }
 
 func opCodeCopy(c *state) {
@@ -903,6 +905,16 @@ func opDifficulty(c *state) {
 
 func opGasLimit(c *state) {
 	c.push1().SetInt64(c.host.GetTxContext().GasLimit)
+}
+
+func opBaseFee(c *state) {
+	if !c.config.London {
+		c.exit(errOpCodeNotFound)
+
+		return
+	}
+
+	c.push(c.host.GetTxContext().BaseFee)
 }
 
 func opSelfDestruct(c *state) {
@@ -982,7 +994,7 @@ func opPush(n int) instruction {
 func opDup(n int) instruction {
 	return func(c *state) {
 		if !c.stackAtLeast(n) {
-			c.exit(errStackUnderflow)
+			c.exit(&runtime.StackUnderflowError{StackLen: c.sp, Required: n})
 		} else {
 			val := c.peekAt(n)
 			c.push1().Set(val)
@@ -993,7 +1005,7 @@ func opDup(n int) instruction {
 func opSwap(n int) instruction {
 	return func(c *state) {
 		if !c.stackAtLeast(n + 1) {
-			c.exit(errStackUnderflow)
+			c.exit(&runtime.StackUnderflowError{StackLen: c.sp, Required: n + 1})
 		} else {
 			c.swap(n)
 		}
@@ -1011,7 +1023,7 @@ func opLog(size int) instruction {
 		}
 
 		if !c.stackAtLeast(2 + size) {
-			c.exit(errStackUnderflow)
+			c.exit(&runtime.StackUnderflowError{StackLen: c.sp, Required: 2 + size})
 
 			return
 		}
@@ -1089,7 +1101,9 @@ func opCreate(op OpCode) instruction {
 		v := c.push1()
 		if op == CREATE && c.config.Homestead && errors.Is(result.Err, runtime.ErrCodeStoreOutOfGas) {
 			v.Set(zero)
-		} else if result.Failed() && !errors.Is(result.Err, runtime.ErrCodeStoreOutOfGas) {
+		} else if op == CREATE && result.Failed() && !errors.Is(result.Err, runtime.ErrCodeStoreOutOfGas) {
+			v.Set(zero)
+		} else if op == CREATE2 && result.Failed() {
 			v.Set(zero)
 		} else {
 			v.SetBytes(contract.Address.Bytes())
@@ -1143,7 +1157,7 @@ func opCall(op OpCode) instruction {
 			callType = runtime.StaticCall
 
 		default:
-			panic("not expected")
+			panic("not expected") //nolint:gocritic
 		}
 
 		contract, offset, size, err := c.buildCallContract(op)
@@ -1173,7 +1187,7 @@ func opCall(op OpCode) instruction {
 		}
 
 		if result.Succeeded() || result.Reverted() {
-			if len(result.ReturnValue) != 0 {
+			if len(result.ReturnValue) != 0 && size > 0 {
 				copy(c.memory[offset:offset+size], result.ReturnValue)
 			}
 		}
@@ -1218,11 +1232,10 @@ func (c *state) buildCallContract(op OpCode) (*runtime.Contract, uint64, uint64,
 		gasCost = 40
 	}
 
-	eip158 := c.config.EIP158
 	transfersValue := (op == CALL || op == CALLCODE) && value != nil && value.Sign() != 0
 
 	if op == CALL {
-		if eip158 {
+		if c.config.EIP158 {
 			if transfersValue && c.host.Empty(addr) {
 				gasCost += 25000
 			}
@@ -1257,7 +1270,14 @@ func (c *state) buildCallContract(op OpCode) (*runtime.Contract, uint64, uint64,
 		gas = initialGas.Uint64()
 	}
 
-	gasCost = gasCost + gas
+	gasCostTmp, isOverflow := common.SafeAddUint64(gasCost, gas)
+	if isOverflow {
+		c.exit(errGasUintOverflow)
+
+		return nil, 0, 0, nil
+	}
+
+	gasCost = gasCostTmp
 
 	// Consume gas cost
 	if !c.consumeGas(gasCost) {
@@ -1295,7 +1315,7 @@ func (c *state) buildCallContract(op OpCode) (*runtime.Contract, uint64, uint64,
 
 	if transfersValue {
 		if c.host.GetBalance(c.msg.Address).Cmp(value) < 0 {
-			return contract, 0, 0, fmt.Errorf("bad")
+			return contract, 0, 0, types.ErrInsufficientFunds
 		}
 	}
 
@@ -1331,14 +1351,14 @@ func (c *state) buildCreateContract(op OpCode) (*runtime.Contract, error) {
 		return nil, nil
 	}
 
-	// Consume memory resize gas (TODO, change with get2)
+	// Consume memory resize gas (TODO, change with get2) (to be fixed in EVM-528) //nolint:godox
 	if !c.consumeGas(gasCost) {
 		return nil, nil
 	}
 
 	if hasTransfer {
 		if c.host.GetBalance(c.msg.Address).Cmp(value) < 0 {
-			return nil, fmt.Errorf("bad")
+			return nil, types.ErrInsufficientFunds
 		}
 	}
 

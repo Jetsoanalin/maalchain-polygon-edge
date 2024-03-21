@@ -39,21 +39,22 @@ func (s *State) NewSnapshotAt(root types.Hash) (state.Snapshot, error) {
 }
 
 func (s *State) newTrie() *Trie {
-	t := NewTrie()
-	t.state = s
-	t.storage = s.storage
-
-	return t
+	return NewTrie()
 }
 
-func (s *State) SetCode(hash types.Hash, code []byte) {
-	s.storage.SetCode(hash, code)
+func (s *State) SetCode(hash types.Hash, code []byte) error {
+	return s.storage.SetCode(hash, code)
 }
 
 func (s *State) GetCode(hash types.Hash) ([]byte, bool) {
+	if hash == types.EmptyCodeHash {
+		return []byte{}, true
+	}
+
 	return s.storage.GetCode(hash)
 }
 
+// newTrieAt returns trie with root and if necessary locks state on a trie level
 func (s *State) newTrieAt(root types.Hash) (*Trie, error) {
 	if root == types.EmptyRootHash {
 		// empty state
@@ -67,14 +68,7 @@ func (s *State) newTrieAt(root types.Hash) (*Trie, error) {
 			return nil, fmt.Errorf("invalid type assertion on root: %s", root)
 		}
 
-		t.state = s
-
-		trie, ok := tt.(*Trie)
-		if !ok {
-			return nil, fmt.Errorf("invalid type assertion on root: %s", root)
-		}
-
-		return trie, nil
+		return t, nil
 	}
 
 	n, ok, err := GetNode(root.Bytes(), s.storage)
@@ -87,9 +81,7 @@ func (s *State) newTrieAt(root types.Hash) (*Trie, error) {
 	}
 
 	t := &Trie{
-		root:    n,
-		state:   s,
-		storage: s.storage,
+		root: n,
 	}
 
 	return t, nil

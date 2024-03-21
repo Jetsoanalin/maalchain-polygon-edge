@@ -55,12 +55,15 @@ func (m *mockChain) WriteBlock(block *types.Block, _ string) error {
 	return nil
 }
 
-func (m *mockChain) VerifyFinalizedBlock(block *types.Block) error {
-	return nil
+func (m *mockChain) VerifyFinalizedBlock(block *types.Block) (*types.FullBlock, error) {
+	return &types.FullBlock{Block: block}, nil
 }
 
 func (m *mockChain) SubscribeEvents() blockchain.Subscription {
 	return blockchain.NewMockSubscription()
+}
+
+func (m *mockChain) UnsubscribeEvents(subscription blockchain.Subscription) {
 }
 
 func getLatestBlockFromMockChain(m *mockChain) *types.Block {

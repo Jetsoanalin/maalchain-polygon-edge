@@ -34,12 +34,11 @@ const (
 )
 
 var (
-	ErrInvalidHookParam             = errors.New("invalid IBFT hook param passed in")
-	ErrProposerSealByNonValidator   = errors.New("proposer seal by non-validator")
-	ErrInvalidMixHash               = errors.New("invalid mixhash")
-	ErrInvalidSha3Uncles            = errors.New("invalid sha3 uncles")
-	ErrWrongDifficulty              = errors.New("wrong difficulty")
-	ErrParentCommittedSealsNotFound = errors.New("parent committed seals not found")
+	ErrInvalidHookParam           = errors.New("invalid IBFT hook param passed in")
+	ErrProposerSealByNonValidator = errors.New("proposer seal by non-validator")
+	ErrInvalidMixHash             = errors.New("invalid mixhash")
+	ErrInvalidSha3Uncles          = errors.New("invalid sha3 uncles")
+	ErrWrongDifficulty            = errors.New("wrong difficulty")
 )
 
 type txPoolInterface interface {
@@ -208,16 +207,16 @@ func (i *backendIBFT) Initialize() error {
 
 // sync runs the syncer in the background to receive blocks from advanced peers
 func (i *backendIBFT) startSyncing() {
-	callInsertBlockHook := func(block *types.Block) bool {
-		if err := i.currentHooks.PostInsertBlock(block); err != nil {
-			i.logger.Error("failed to call PostInsertBlock", "height", block.Header.Number, "error", err)
+	callInsertBlockHook := func(fullBlock *types.FullBlock) bool {
+		if err := i.currentHooks.PostInsertBlock(fullBlock.Block); err != nil {
+			i.logger.Error("failed to call PostInsertBlock", "height", fullBlock.Block.Header.Number, "error", err)
 		}
 
-		if err := i.updateCurrentModules(block.Number() + 1); err != nil {
-			i.logger.Error("failed to update sub modules", "height", block.Number()+1, "err", err)
+		if err := i.updateCurrentModules(fullBlock.Block.Number() + 1); err != nil {
+			i.logger.Error("failed to update sub modules", "height", fullBlock.Block.Number()+1, "err", err)
 		}
 
-		i.txpool.ResetWithHeaders(block.Header)
+		i.txpool.ResetWithHeaders(fullBlock.Block.Header)
 
 		return false
 	}
@@ -275,7 +274,7 @@ func (i *backendIBFT) startConsensus() {
 		}
 	}()
 
-	defer newBlockSub.Close()
+	defer i.blockchain.UnsubscribeEvents(newBlockSub)
 
 	var (
 		sequenceCh  = make(<-chan struct{})
@@ -344,6 +343,9 @@ func (i *backendIBFT) updateMetrics(block *types.Block) {
 
 	// Update the Number of transactions in the block metric
 	metrics.SetGauge([]string{consensusMetrics, "num_txs"}, float32(len(block.Body().Transactions)))
+
+	// Update the base fee metric
+	metrics.SetGauge([]string{consensusMetrics, "base_fee"}, float32(block.Header.BaseFee))
 }
 
 // verifyHeaderImpl verifies fields including Extra
@@ -428,10 +430,25 @@ func (i *backendIBFT) VerifyHeader(header *types.Header) error {
 		return err
 	}
 
+	extra, err := headerSigner.GetIBFTExtra(header)
+	if err != nil {
+		return err
+	}
+
+	hashForCommittedSeal, err := i.calculateProposalHash(
+		headerSigner,
+		header,
+		extra.RoundNumber,
+	)
+	if err != nil {
+		return err
+	}
+
 	// verify the Committed Seals
 	// CommittedSeals exists only in the finalized header
 	if err := headerSigner.VerifyCommittedSeals(
-		header,
+		hashForCommittedSeal,
+		extra.CommittedSeals,
 		validators,
 		i.quorumSize(header.Number)(validators),
 	); err != nil {
@@ -476,10 +493,10 @@ func (i *backendIBFT) GetBlockCreator(header *types.Header) (types.Address, erro
 }
 
 // PreCommitState a hook to be called before finalizing state transition on inserting block
-func (i *backendIBFT) PreCommitState(header *types.Header, txn *state.Transition) error {
-	hooks := i.forkManager.GetHooks(header.Number)
+func (i *backendIBFT) PreCommitState(block *types.Block, txn *state.Transition) error {
+	hooks := i.forkManager.GetHooks(block.Number())
 
-	return hooks.PreCommitState(header, txn)
+	return hooks.PreCommitState(block.Header, txn)
 }
 
 // GetEpoch returns the current epoch
@@ -532,6 +549,16 @@ func (i *backendIBFT) SetHeaderHash() {
 	}
 }
 
+// GetBridgeProvider returns an instance of BridgeDataProvider
+func (i *backendIBFT) GetBridgeProvider() consensus.BridgeDataProvider {
+	return nil
+}
+
+// FilterExtra is the implementation of Consensus interface
+func (i *backendIBFT) FilterExtra(extra []byte) ([]byte, error) {
+	return extra, nil
+}
+
 // updateCurrentModules updates Signer, Hooks, and Validators
 // that are used at specified height
 // by fetching from ForkManager
@@ -573,7 +600,25 @@ func (i *backendIBFT) verifyParentCommittedSeals(
 		i.forkManager,
 		parent.Number,
 	)
+	if err != nil {
+		return err
+	}
 
+	parentHeader, ok := i.blockchain.GetHeaderByHash(parent.Hash)
+	if !ok {
+		return fmt.Errorf("header %s not found", parent.Hash)
+	}
+
+	parentExtra, err := parentSigner.GetIBFTExtra(parentHeader)
+	if err != nil {
+		return err
+	}
+
+	parentHash, err := i.calculateProposalHash(
+		parentSigner,
+		parentHeader,
+		parentExtra.RoundNumber,
+	)
 	if err != nil {
 		return err
 	}
@@ -581,7 +626,7 @@ func (i *backendIBFT) verifyParentCommittedSeals(
 	// if shouldVerifyParentCommittedSeals is false, skip the verification
 	// when header doesn't have Parent Committed Seals (Backward Compatibility)
 	return parentSigner.VerifyParentCommittedSeals(
-		parent,
+		parentHash,
 		header,
 		parentValidators,
 		i.quorumSize(parent.Number)(parentValidators),

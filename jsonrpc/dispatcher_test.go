@@ -2,14 +2,17 @@ package jsonrpc
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/0xPolygon/polygon-edge/txpool/proto"
 	"github.com/0xPolygon/polygon-edge/types"
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -58,20 +61,20 @@ func expectBatchJSONResult(data []byte, v interface{}) error {
 func TestDispatcher_HandleWebsocketConnection_EthSubscribe(t *testing.T) {
 	t.Parallel()
 
-	t.Run("clients should be able to receive \"newHeads\" event thru eth_subscribe", func(t *testing.T) {
-		t.Parallel()
+	store := newMockStore()
+	dispatcher := newTestDispatcher(t,
+		hclog.NewNullLogger(),
+		store,
+		&dispatcherParams{
+			chainID:                 0,
+			priceLimit:              0,
+			jsonRPCBatchLengthLimit: 20,
+			blockRangeLimit:         1000,
+		},
+	)
 
-		store := newMockStore()
-		dispatcher := newDispatcher(
-			hclog.NewNullLogger(),
-			store,
-			&dispatcherParams{
-				chainID:                 0,
-				priceLimit:              0,
-				jsonRPCBatchLengthLimit: 20,
-				blockRangeLimit:         1000,
-			},
-		)
+	t.Run("clients should be able to receive \"newHeads\" event through eth_subscribe", func(t *testing.T) {
+		t.Parallel()
 
 		mockConnection, msgCh := newMockWsConnWithMsgCh()
 
@@ -79,9 +82,8 @@ func TestDispatcher_HandleWebsocketConnection_EthSubscribe(t *testing.T) {
 		"method": "eth_subscribe",
 		"params": ["newHeads"]
 	}`)
-		if _, err := dispatcher.HandleWs(req, mockConnection); err != nil {
-			t.Fatal(err)
-		}
+		_, err := dispatcher.HandleWs(req, mockConnection)
+		require.NoError(t, err)
 
 		store.emitEvent(&mockEvent{
 			NewChain: []*mockHeader{
@@ -99,11 +101,34 @@ func TestDispatcher_HandleWebsocketConnection_EthSubscribe(t *testing.T) {
 			t.Fatal("\"newHeads\" event not received in 2 seconds")
 		}
 	})
+
+	t.Run("clients should be able to receive \"newPendingTransactions\" event through eth_subscribe", func(t *testing.T) {
+		t.Parallel()
+
+		mockConnection, msgCh := newMockWsConnWithMsgCh()
+
+		req := []byte(`{
+		"method": "eth_subscribe",
+		"params": ["newPendingTransactions"]
+	}`)
+		_, err := dispatcher.HandleWs(req, mockConnection)
+		require.NoError(t, err)
+
+		store.emitTxPoolEvent(proto.EventType_ADDED, "evt1")
+
+		select {
+		case <-msgCh:
+		case <-time.After(2 * time.Second):
+			t.Fatal("\"newPendingTransactions\" event not received in 2 seconds")
+		}
+	})
 }
 
 func TestDispatcher_WebsocketConnection_RequestFormats(t *testing.T) {
+	t.Parallel()
+
 	store := newMockStore()
-	dispatcher := newDispatcher(
+	dispatcher := newTestDispatcher(t,
 		hclog.NewNullLogger(),
 		store,
 		&dispatcherParams{
@@ -212,9 +237,11 @@ func (m *mockService) Filter(f LogQuery) (interface{}, error) {
 }
 
 func TestDispatcherFuncDecode(t *testing.T) {
+	t.Parallel()
+
 	srv := &mockService{msgCh: make(chan interface{}, 10)}
 
-	dispatcher := newDispatcher(
+	dispatcher := newTestDispatcher(t,
 		hclog.NewNullLogger(),
 		newMockStore(),
 		&dispatcherParams{
@@ -224,7 +251,8 @@ func TestDispatcherFuncDecode(t *testing.T) {
 			blockRangeLimit:         1000,
 		},
 	)
-	dispatcher.registerService("mock", srv)
+
+	require.NoError(t, dispatcher.registerService("mock", srv))
 
 	handleReq := func(typ string, msg string) interface{} {
 		_, err := dispatcher.handleReq(Request{
@@ -276,37 +304,46 @@ func TestDispatcherFuncDecode(t *testing.T) {
 		{
 			"filter",
 			`[{"fromBlock": "pending", "toBlock": "earliest"}]`,
-			LogQuery{fromBlock: LatestBlockNumber, toBlock: EarliestBlockNumber}, // pending = latest
+			LogQuery{fromBlock: LatestBlockNumber, toBlock: EarliestBlockNumber}, // pending == latest
 		},
 	}
 
 	for _, c := range cases {
 		res := handleReq(c.typ, c.msg)
 		if !reflect.DeepEqual(res, c.res) {
-			t.Fatal("bad")
+			t.Fatal("no tx pool events received in the predefined time slot")
 		}
 	}
 }
 
 func TestDispatcherBatchRequest(t *testing.T) {
-	handle := func(dispatcher *Dispatcher, reqBody []byte) []byte {
-		res, _ := dispatcher.Handle(reqBody)
+	t.Parallel()
 
-		return res
-	}
-
-	cases := []struct {
+	type caseData struct {
 		name          string
 		desc          string
 		dispatcher    *Dispatcher
 		reqBody       []byte
 		err           *ObjectError
 		batchResponse []*SuccessResponse
-	}{
+	}
+
+	mock := &mockWsConn{
+		SetFilterIDFn: func(s string) {
+		},
+		GetFilterIDFn: func() string {
+			return ""
+		},
+		WriteMessageFn: func(i int, b []byte) error {
+			return nil
+		},
+	}
+
+	cases := []caseData{
 		{
 			"leading-whitespace",
 			"test with leading whitespace (\"  \\t\\n\\n\\r\\)",
-			newDispatcher(
+			newTestDispatcher(t,
 				hclog.NewNullLogger(),
 				newMockStore(),
 				&dispatcherParams{
@@ -331,7 +368,7 @@ func TestDispatcherBatchRequest(t *testing.T) {
 		{
 			"valid-batch-req",
 			"test with batch req length within batchRequestLengthLimit",
-			newDispatcher(
+			newTestDispatcher(t,
 				hclog.NewNullLogger(),
 				newMockStore(),
 				&dispatcherParams{
@@ -360,7 +397,7 @@ func TestDispatcherBatchRequest(t *testing.T) {
 		{
 			"invalid-batch-req",
 			"test with batch req length exceeding batchRequestLengthLimit",
-			newDispatcher(
+			newTestDispatcher(t,
 				hclog.NewNullLogger(),
 				newMockStore(),
 				&dispatcherParams{
@@ -383,7 +420,7 @@ func TestDispatcherBatchRequest(t *testing.T) {
 		{
 			"no-limits",
 			"test when limits are not set",
-			newDispatcher(
+			newTestDispatcher(t,
 				hclog.NewNullLogger(),
 				newMockStore(),
 				&dispatcherParams{
@@ -424,14 +461,12 @@ func TestDispatcherBatchRequest(t *testing.T) {
 		},
 	}
 
-	for _, c := range cases {
-		res := handle(c.dispatcher, c.reqBody)
-
+	check := func(c caseData, res []byte) {
 		if c.err != nil {
 			var resp ErrorResponse
 
 			assert.NoError(t, expectBatchJSONResult(res, &resp))
-			assert.Equal(t, resp.Error, c.err)
+			assert.Equal(t, c.err, resp.Error)
 		} else {
 			var batchResp []SuccessResponse
 			assert.NoError(t, expectBatchJSONResult(res, &batchResp))
@@ -439,19 +474,94 @@ func TestDispatcherBatchRequest(t *testing.T) {
 			if c.name == "leading-whitespace" {
 				assert.Len(t, batchResp, 4)
 				for index, resp := range batchResp {
-					assert.Equal(t, resp.Error, c.batchResponse[index].Error)
+					assert.Equal(t, c.batchResponse[index].Error, resp.Error)
 				}
 			} else if c.name == "valid-batch-req" {
 				assert.Len(t, batchResp, 6)
 				for index, resp := range batchResp {
-					assert.Equal(t, resp.Error, c.batchResponse[index].Error)
+					assert.Equal(t, c.batchResponse[index].Error, resp.Error)
 				}
 			} else if c.name == "no-limits" {
 				assert.Len(t, batchResp, 12)
 				for index, resp := range batchResp {
-					assert.Equal(t, resp.Error, c.batchResponse[index].Error)
+					assert.Equal(t, c.batchResponse[index].Error, resp.Error)
 				}
 			}
 		}
 	}
+
+	for _, c := range cases {
+		c := c
+
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			res, _ := c.dispatcher.HandleWs(c.reqBody, mock)
+
+			check(c, res)
+
+			res, _ = c.dispatcher.Handle(c.reqBody)
+
+			check(c, res)
+		})
+	}
+}
+
+func TestDispatcher_WebsocketConnection_Unsubscribe(t *testing.T) {
+	t.Parallel()
+
+	store := newMockStore()
+	dispatcher := newTestDispatcher(t,
+		hclog.NewNullLogger(),
+		store,
+		&dispatcherParams{
+			chainID:                 0,
+			priceLimit:              0,
+			jsonRPCBatchLengthLimit: 20,
+			blockRangeLimit:         1000,
+		},
+	)
+	mockConn := &mockWsConn{
+		SetFilterIDFn: func(s string) {
+		},
+		GetFilterIDFn: func() string {
+			return ""
+		},
+		WriteMessageFn: func(i int, b []byte) error {
+			return nil
+		},
+	}
+
+	resp := SuccessResponse{}
+	reqUnsub := func(n string) []byte {
+		return []byte(fmt.Sprintf(`{"method": "eth_unsubscribe", "params": [%s]}`, n))
+	}
+
+	// non existing subscription
+	r, err := dispatcher.HandleWs(reqUnsub("\"787832\""), mockConn)
+	require.NoError(t, err)
+
+	require.NoError(t, json.Unmarshal(r, &resp))
+	assert.Equal(t, "false", string(resp.Result))
+
+	r, err = dispatcher.HandleWs([]byte(`{"method": "eth_subscribe", "params": ["newHeads"]}`), mockConn)
+	require.NoError(t, err)
+
+	require.NoError(t, json.Unmarshal(r, &resp))
+
+	// existing subscription
+	r, err = dispatcher.HandleWs(reqUnsub(string(resp.Result)), mockConn)
+	require.NoError(t, err)
+
+	require.NoError(t, json.Unmarshal(r, &resp))
+	assert.Equal(t, "true", string(resp.Result))
+}
+
+func newTestDispatcher(tb testing.TB, logger hclog.Logger, store JSONRPCStore, params *dispatcherParams) *Dispatcher {
+	tb.Helper()
+
+	d, err := newDispatcher(logger, store, params)
+	require.NoError(tb, err)
+
+	return d
 }

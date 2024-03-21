@@ -3,10 +3,11 @@ package ibft
 import (
 	"context"
 	"fmt"
-	"math"
+	"math/big"
 	"time"
 
 	"github.com/0xPolygon/go-ibft/messages"
+	"github.com/0xPolygon/go-ibft/messages/proto"
 	"github.com/0xPolygon/polygon-edge/consensus"
 	"github.com/0xPolygon/polygon-edge/consensus/ibft/signer"
 	"github.com/0xPolygon/polygon-edge/helper/hex"
@@ -14,13 +15,13 @@ import (
 	"github.com/0xPolygon/polygon-edge/types"
 )
 
-func (i *backendIBFT) BuildProposal(blockNumber uint64) []byte {
+func (i *backendIBFT) BuildProposal(view *proto.View) []byte {
 	var (
 		latestHeader      = i.blockchain.Header()
 		latestBlockNumber = latestHeader.Number
 	)
 
-	if latestBlockNumber+1 != blockNumber {
+	if latestBlockNumber+1 != view.Height {
 		i.logger.Error(
 			"unable to build block, due to lack of parent block",
 			"num",
@@ -32,7 +33,7 @@ func (i *backendIBFT) BuildProposal(blockNumber uint64) []byte {
 
 	block, err := i.buildBlock(latestHeader)
 	if err != nil {
-		i.logger.Error("cannot build block", "num", blockNumber, "err", err)
+		i.logger.Error("cannot build block", "num", view.Height, "err", err)
 
 		return nil
 	}
@@ -40,12 +41,13 @@ func (i *backendIBFT) BuildProposal(blockNumber uint64) []byte {
 	return block.MarshalRLP()
 }
 
-func (i *backendIBFT) InsertBlock(
-	proposal []byte,
+// InsertProposal inserts a proposal of which the consensus has been got
+func (i *backendIBFT) InsertProposal(
+	proposal *proto.Proposal,
 	committedSeals []*messages.CommittedSeal,
 ) {
 	newBlock := &types.Block{}
-	if err := newBlock.UnmarshalRLP(proposal); err != nil {
+	if err := newBlock.UnmarshalRLP(proposal.RawProposal); err != nil {
 		i.logger.Error("cannot unmarshal proposal", "err", err)
 
 		return
@@ -63,7 +65,7 @@ func (i *backendIBFT) InsertBlock(
 	copy(extraDataBackup, extraDataOriginal)
 
 	// Push the committed seals to the header
-	header, err := i.currentSigner.WriteCommittedSeals(newBlock.Header, committedSealsMap)
+	header, err := i.currentSigner.WriteCommittedSeals(newBlock.Header, proposal.Round, committedSealsMap)
 	if err != nil {
 		i.logger.Error("cannot write committed seals", "err", err)
 
@@ -138,22 +140,21 @@ func (i *backendIBFT) MaximumFaultyNodes() uint64 {
 	return uint64(CalcMaxFaultyNodes(i.currentValidators))
 }
 
-func (i *backendIBFT) Quorum(blockNumber uint64) uint64 {
-	validators, err := i.forkManager.GetValidators(blockNumber)
+// DISCLAIMER: IBFT will be deprecated so we set 1 as a voting power to all validators
+func (i *backendIBFT) GetVotingPowers(height uint64) (map[string]*big.Int, error) {
+	validators, err := i.forkManager.GetValidators(height)
 	if err != nil {
-		i.logger.Error(
-			"failed to get validators when calculation quorum",
-			"height", blockNumber,
-			"err", err,
-		)
-
-		// return Math.MaxInt32 to prevent overflow when casting to int in go-ibft package
-		return math.MaxInt32
+		return nil, err
 	}
 
-	quorumFn := i.quorumSize(blockNumber)
+	result := make(map[string]*big.Int, validators.Len())
 
-	return uint64(quorumFn(validators))
+	for index := 0; index < validators.Len(); index++ {
+		strAddress := types.AddressToString(validators.At(uint64(index)).Addr())
+		result[strAddress] = big.NewInt(1) // set 1 as voting power to everyone
+	}
+
+	return result, nil
 }
 
 // buildBlock builds the block, based on the passed in snapshot and parent header
@@ -177,6 +178,7 @@ func (i *backendIBFT) buildBlock(parent *types.Header) (*types.Block, error) {
 		return nil, err
 	}
 
+	// calculate base fee
 	header.GasLimit = gasLimit
 
 	if err := i.currentHooks.ModifyHeader(header, i.currentSigner.Address()); err != nil {
@@ -184,7 +186,7 @@ func (i *backendIBFT) buildBlock(parent *types.Header) (*types.Block, error) {
 	}
 
 	// Set the header timestamp
-	potentialTimestamp := i.calcHeaderTimestamp(parent.Timestamp, time.Now())
+	potentialTimestamp := i.calcHeaderTimestamp(parent.Timestamp, time.Now().UTC())
 	header.Timestamp = uint64(potentialTimestamp.Unix())
 
 	parentCommittedSeals, err := i.extractParentCommittedSeals(parent)
@@ -210,11 +212,17 @@ func (i *backendIBFT) buildBlock(parent *types.Header) (*types.Block, error) {
 		transition,
 	)
 
-	if err := i.PreCommitState(header, transition); err != nil {
+	// provide dummy block instance to the PreCommitState
+	// (for the IBFT consensus, it is correct to have just a header, as only it is used)
+	if err := i.PreCommitState(&types.Block{Header: header}, transition); err != nil {
 		return nil, err
 	}
 
-	_, root := transition.Commit()
+	_, root, err := transition.Commit()
+	if err != nil {
+		return nil, fmt.Errorf("failed to commit the state changes: %w", err)
+	}
+
 	header.StateRoot = root
 	header.GasUsed = transition.TotalGas()
 
@@ -282,7 +290,6 @@ type txExeResult struct {
 
 type transitionInterface interface {
 	Write(txn *types.Transaction) error
-	WriteFailedReceipt(txn *types.Transaction) error
 }
 
 func (i *backendIBFT) writeTransactions(
@@ -361,17 +368,8 @@ func (i *backendIBFT) writeTransaction(
 		return nil, false
 	}
 
-	if tx.ExceedsBlockGasLimit(gasLimit) {
+	if tx.Gas > gasLimit {
 		i.txpool.Drop(tx)
-
-		if err := transition.WriteFailedReceipt(tx); err != nil {
-			i.logger.Error(
-				fmt.Sprintf(
-					"unable to write failed receipt for transaction %s",
-					tx.Hash,
-				),
-			)
-		}
 
 		// continue processing
 		return &txExeResult{tx, fail}, true

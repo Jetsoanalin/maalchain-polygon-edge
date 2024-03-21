@@ -15,18 +15,21 @@ func (s *Server) setupTelemetry() error {
 	inm := metrics.NewInmemSink(10*time.Second, time.Minute)
 	metrics.DefaultInmemSignal(inm)
 
-	promSink, err := prometheus.NewPrometheusSink()
+	promSink, err := prometheus.NewPrometheusSinkFrom(prometheus.PrometheusOpts{
+		Name:       "edge_prometheus_sink",
+		Expiration: 0,
+	})
 	if err != nil {
 		return err
 	}
 
 	metricsConf := metrics.DefaultConfig("edge")
 	metricsConf.EnableHostname = false
-	metrics.NewGlobal(metricsConf, metrics.FanoutSink{
+	_, err = metrics.NewGlobal(metricsConf, metrics.FanoutSink{
 		inm, promSink,
 	})
 
-	return nil
+	return err
 }
 
 // enableDataDogProfiler enables DataDog profiler. Enable it by setting DD_ENABLE env var.

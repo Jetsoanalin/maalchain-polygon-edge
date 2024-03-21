@@ -1,6 +1,7 @@
 package evm
 
 import (
+	"math"
 	"math/big"
 	"testing"
 
@@ -101,18 +102,23 @@ func TestMStore(t *testing.T) {
 	assert.Len(t, s.memory, 1024+32)
 }
 
-type mockHostForCreate struct {
+type mockHostForInstructions struct {
 	mockHost
 	nonce       uint64
+	code        []byte
 	callxResult *runtime.ExecutionResult
 }
 
-func (m *mockHostForCreate) GetNonce(types.Address) uint64 {
+func (m *mockHostForInstructions) GetNonce(types.Address) uint64 {
 	return m.nonce
 }
 
-func (m *mockHostForCreate) Callx(*runtime.Contract, runtime.Host) *runtime.ExecutionResult {
+func (m *mockHostForInstructions) Callx(*runtime.Contract, runtime.Host) *runtime.ExecutionResult {
 	return m.callxResult
+}
+
+func (m *mockHostForInstructions) GetCode(addr types.Address) []byte {
+	return m.code
 }
 
 var (
@@ -140,7 +146,7 @@ func TestCreate(t *testing.T) {
 		config      *chain.ForksInTime
 		initState   *state
 		resultState *state
-		mockHost    *mockHostForCreate
+		mockHost    *mockHostForInstructions
 	}{
 		{
 			name: "should succeed in case of CREATE",
@@ -174,7 +180,7 @@ func TestCreate(t *testing.T) {
 					byte(REVERT),
 				},
 			},
-			mockHost: &mockHostForCreate{
+			mockHost: &mockHostForInstructions{
 				nonce: 0,
 				callxResult: &runtime.ExecutionResult{
 					GasLeft: 500,
@@ -218,7 +224,7 @@ func TestCreate(t *testing.T) {
 				stop: true,
 				err:  errWriteProtection,
 			},
-			mockHost: &mockHostForCreate{},
+			mockHost: &mockHostForInstructions{},
 		},
 		{
 			name:     "should throw errOpCodeNotFound when op is CREATE2 and config.Constantinople is disabled",
@@ -256,7 +262,7 @@ func TestCreate(t *testing.T) {
 				stop: true,
 				err:  errOpCodeNotFound,
 			},
-			mockHost: &mockHostForCreate{},
+			mockHost: &mockHostForInstructions{},
 		},
 		{
 			name: "should set zero address if op is CREATE and contract call throws ErrCodeStoreOutOfGas",
@@ -298,7 +304,7 @@ func TestCreate(t *testing.T) {
 				stop: false,
 				err:  nil,
 			},
-			mockHost: &mockHostForCreate{
+			mockHost: &mockHostForInstructions{
 				nonce: 0,
 				callxResult: &runtime.ExecutionResult{
 					GasLeft: 1000,
@@ -346,11 +352,62 @@ func TestCreate(t *testing.T) {
 				stop: false,
 				err:  nil,
 			},
-			mockHost: &mockHostForCreate{
+			mockHost: &mockHostForInstructions{
 				nonce: 0,
 				callxResult: &runtime.ExecutionResult{
 					GasLeft: 1000,
 					Err:     errRevert,
+				},
+			},
+		},
+		{
+			name: "should set zero address if contract call throws any error for CREATE2",
+			op:   CREATE2,
+			contract: &runtime.Contract{
+				Static:  false,
+				Address: addr1,
+			},
+			config: &chain.ForksInTime{
+				Homestead:      true,
+				Constantinople: true,
+			},
+			initState: &state{
+				gas: 1000,
+				sp:  4,
+				stack: []*big.Int{
+					big.NewInt(0x01), // salt
+					big.NewInt(0x01), // length
+					big.NewInt(0x00), // offset
+					big.NewInt(0x00), // value
+				},
+				memory: []byte{
+					byte(REVERT),
+				},
+				stop: false,
+				err:  nil,
+			},
+			// during creation of code with length 1 for CREATE2 op code, 985 gas units are spent by buildCreateContract()
+			resultState: &state{
+				gas: 15,
+				sp:  1,
+				stack: []*big.Int{
+					big.NewInt(0x01).SetInt64(0x00),
+					big.NewInt(0x01),
+					big.NewInt(0x00),
+					big.NewInt(0x00),
+				},
+				memory: []byte{
+					byte(REVERT),
+				},
+				stop: false,
+				err:  nil,
+			},
+			mockHost: &mockHostForInstructions{
+				nonce: 0,
+				callxResult: &runtime.ExecutionResult{
+					// if it is ErrCodeStoreOutOfGas then we set GasLeft to 0
+					GasLeft: 0,
+					Err:     runtime.ErrCodeStoreOutOfGas,
 				},
 			},
 		},
@@ -409,7 +466,7 @@ func Test_opReturnDataCopy(t *testing.T) {
 			config: &allEnabledForks,
 			initState: &state{
 				stack: []*big.Int{
-					big.NewInt(0),  // length
+					big.NewInt(1),  // length
 					big.NewInt(0),  // dataOffset
 					big.NewInt(-1), // memOffset
 				},
@@ -418,13 +475,13 @@ func Test_opReturnDataCopy(t *testing.T) {
 			resultState: &state{
 				config: &allEnabledForks,
 				stack: []*big.Int{
-					big.NewInt(0),
+					big.NewInt(1),
 					big.NewInt(0),
 					big.NewInt(-1),
 				},
 				sp:   0,
 				stop: true,
-				err:  errGasUintOverflow,
+				err:  errReturnDataOutOfBounds,
 			},
 		},
 		{
@@ -449,7 +506,7 @@ func Test_opReturnDataCopy(t *testing.T) {
 				sp:     0,
 				memory: make([]byte, 1),
 				stop:   true,
-				err:    errGasUintOverflow,
+				err:    errReturnDataOutOfBounds,
 			},
 		},
 		{
@@ -472,7 +529,7 @@ func Test_opReturnDataCopy(t *testing.T) {
 				},
 				sp:   0,
 				stop: true,
-				err:  errGasUintOverflow,
+				err:  errReturnDataOutOfBounds,
 			},
 		},
 		{
@@ -541,6 +598,34 @@ func Test_opReturnDataCopy(t *testing.T) {
 				err:                nil,
 			},
 		},
+		{
+			// this test case also verifies that code does not panic when the length is 0 and memOffset > len(memory)
+			name:   "should not copy data if length is zero",
+			config: &allEnabledForks,
+			initState: &state{
+				stack: []*big.Int{
+					big.NewInt(0), // length
+					big.NewInt(0), // dataOffset
+					big.NewInt(4), // memOffset
+				},
+				sp:         3,
+				returnData: []byte{0x01},
+				memory:     []byte{0x02},
+			},
+			resultState: &state{
+				config: &allEnabledForks,
+				stack: []*big.Int{
+					big.NewInt(0),
+					big.NewInt(0),
+					big.NewInt(4),
+				},
+				sp:         0,
+				returnData: []byte{0x01},
+				memory:     []byte{0x02},
+				stop:       false,
+				err:        nil,
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -571,6 +656,144 @@ func Test_opReturnDataCopy(t *testing.T) {
 			opReturnDataCopy(state)
 
 			assert.Equal(t, test.resultState, state)
+		})
+	}
+}
+
+func Test_opCall(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		op          OpCode
+		contract    *runtime.Contract
+		config      chain.ForksInTime
+		initState   *state
+		resultState *state
+		mockHost    *mockHostForInstructions
+	}{
+		{
+			// this test case also verifies that code does not panic when the outSize is 0 and outOffset > len(memory)
+			name: "should not copy result into memory if outSize is 0",
+			op:   STATICCALL,
+			contract: &runtime.Contract{
+				Static: true,
+			},
+			config: allEnabledForks,
+			initState: &state{
+				gas: 1000,
+				sp:  6,
+				stack: []*big.Int{
+					big.NewInt(0x00), // outSize
+					big.NewInt(0x02), // outOffset
+					big.NewInt(0x00), // inSize
+					big.NewInt(0x00), // inOffset
+					big.NewInt(0x00), // address
+					big.NewInt(0x00), // initialGas
+				},
+				memory: []byte{0x01},
+			},
+			resultState: &state{
+				memory: []byte{0x01},
+				stop:   false,
+				err:    nil,
+				gas:    300,
+			},
+			mockHost: &mockHostForInstructions{
+				callxResult: &runtime.ExecutionResult{
+					ReturnValue: []byte{0x03},
+				},
+			},
+		},
+		{
+			name: "call cost overflow (EIP150 fork disabled)",
+			op:   CALLCODE,
+			contract: &runtime.Contract{
+				Static: false,
+			},
+			config: chain.AllForksEnabled.RemoveFork(chain.EIP150).At(0),
+			initState: &state{
+				gas: 6640,
+				sp:  7,
+				stack: []*big.Int{
+					big.NewInt(0x00),                        // outSize
+					big.NewInt(0x00),                        // outOffset
+					big.NewInt(0x00),                        // inSize
+					big.NewInt(0x00),                        // inOffset
+					big.NewInt(0x01),                        // value
+					big.NewInt(0x03),                        // address
+					big.NewInt(0).SetUint64(math.MaxUint64), // initialGas
+				},
+				memory: []byte{0x01},
+			},
+			resultState: &state{
+				memory: []byte{0x01},
+				stop:   true,
+				err:    errGasUintOverflow,
+				gas:    6640,
+			},
+			mockHost: &mockHostForInstructions{
+				callxResult: &runtime.ExecutionResult{
+					ReturnValue: []byte{0x03},
+				},
+			},
+		},
+		{
+			name: "available gas underflow",
+			op:   CALLCODE,
+			contract: &runtime.Contract{
+				Static: false,
+			},
+			config: allEnabledForks,
+			initState: &state{
+				gas: 6640,
+				sp:  7,
+				stack: []*big.Int{
+					big.NewInt(0x00),                        // outSize
+					big.NewInt(0x00),                        // outOffset
+					big.NewInt(0x00),                        // inSize
+					big.NewInt(0x00),                        // inOffset
+					big.NewInt(0x01),                        // value
+					big.NewInt(0x03),                        // address
+					big.NewInt(0).SetUint64(math.MaxUint64), // initialGas
+				},
+				memory: []byte{0x01},
+			},
+			resultState: &state{
+				memory: []byte{0x01},
+				stop:   true,
+				err:    errOutOfGas,
+				gas:    6640,
+			},
+			mockHost: &mockHostForInstructions{
+				callxResult: &runtime.ExecutionResult{
+					ReturnValue: []byte{0x03},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		test := tt
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			state, closeFn := getState()
+			defer closeFn()
+
+			state.gas = test.initState.gas
+			state.msg = test.contract
+			state.sp = test.initState.sp
+			state.stack = test.initState.stack
+			state.memory = test.initState.memory
+			state.config = &test.config
+			state.host = test.mockHost
+
+			opCall(test.op)(state)
+
+			assert.Equal(t, test.resultState.memory, state.memory, "memory in state after execution is incorrect")
+			assert.Equal(t, test.resultState.stop, state.stop, "stop in state after execution is incorrect")
+			assert.Equal(t, test.resultState.err, state.err, "err in state after execution is incorrect")
+			assert.Equal(t, test.resultState.gas, state.gas, "gas in state after execution is incorrect")
 		})
 	}
 }

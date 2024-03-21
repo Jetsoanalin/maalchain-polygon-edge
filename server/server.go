@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
@@ -11,13 +12,20 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/0xPolygon/polygon-edge/blockchain/storage"
+	"github.com/0xPolygon/polygon-edge/blockchain/storage/leveldb"
+	"github.com/0xPolygon/polygon-edge/blockchain/storage/memory"
+	consensusPolyBFT "github.com/0xPolygon/polygon-edge/consensus/polybft"
+	"github.com/0xPolygon/polygon-edge/forkmanager"
+	"github.com/0xPolygon/polygon-edge/gasprice"
+
 	"github.com/0xPolygon/polygon-edge/archive"
 	"github.com/0xPolygon/polygon-edge/blockchain"
 	"github.com/0xPolygon/polygon-edge/chain"
 	"github.com/0xPolygon/polygon-edge/consensus"
+	"github.com/0xPolygon/polygon-edge/contracts"
 	"github.com/0xPolygon/polygon-edge/crypto"
 	"github.com/0xPolygon/polygon-edge/helper/common"
-	configHelper "github.com/0xPolygon/polygon-edge/helper/config"
 	"github.com/0xPolygon/polygon-edge/helper/progress"
 	"github.com/0xPolygon/polygon-edge/jsonrpc"
 	"github.com/0xPolygon/polygon-edge/network"
@@ -26,13 +34,20 @@ import (
 	"github.com/0xPolygon/polygon-edge/state"
 	itrie "github.com/0xPolygon/polygon-edge/state/immutable-trie"
 	"github.com/0xPolygon/polygon-edge/state/runtime"
+	"github.com/0xPolygon/polygon-edge/state/runtime/addresslist"
 	"github.com/0xPolygon/polygon-edge/state/runtime/tracer"
 	"github.com/0xPolygon/polygon-edge/txpool"
 	"github.com/0xPolygon/polygon-edge/types"
+	"github.com/0xPolygon/polygon-edge/validate"
 	"github.com/hashicorp/go-hclog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
+)
+
+var (
+	errBlockTimeMissing = errors.New("block time configuration is missing")
+	errBlockTimeInvalid = errors.New("block time configuration is invalid")
 )
 
 // Server is the central manager of the blockchain client
@@ -70,11 +85,9 @@ type Server struct {
 
 	// restore
 	restoreProgression *progress.ProgressionWrapper
-}
 
-var dirPaths = []string{
-	"blockchain",
-	"trie",
+	// gasHelper is providing functions regarding gas and fees
+	gasHelper *gasprice.GasHelper
 }
 
 // newFileLogger returns logger instance that writes all logs to a specified file.
@@ -129,14 +142,23 @@ func NewServer(config *Config) (*Server, error) {
 		logger:             logger.Named("server"),
 		config:             config,
 		chain:              config.Chain,
-		grpcServer:         grpc.NewServer(),
+		grpcServer:         grpc.NewServer(grpc.UnaryInterceptor(unaryInterceptor)),
 		restoreProgression: progress.NewProgressionWrapper(progress.ChainSyncRestore),
+	}
+
+	if config.Chain.Params.GetEngine() == string(IBFTConsensus) {
+		m.logger.Info(common.IBFTImportantNotice)
 	}
 
 	m.logger.Info("Data dir", "path", config.DataDir)
 
+	var dirPaths = []string{
+		"blockchain",
+		"trie",
+	}
+
 	// Generate all the paths in the dataDir
-	if err := common.SetupDataDir(config.DataDir, dirPaths); err != nil {
+	if err := common.SetupDataDir(config.DataDir, dirPaths, 0770); err != nil {
 		return nil, fmt.Errorf("failed to create data directories: %w", err)
 	}
 
@@ -186,15 +208,128 @@ func NewServer(config *Config) (*Server, error) {
 
 	m.executor = state.NewExecutor(config.Chain.Params, st, logger)
 
+	// custom write genesis hook per consensus engine
+	engineName := m.config.Chain.Params.GetEngine()
+	if factory, exists := genesisCreationFactory[ConsensusType(engineName)]; exists {
+		m.executor.GenesisPostHook = factory(m.config.Chain, engineName)
+	}
+
+	// apply allow list contracts deployer genesis data
+	if m.config.Chain.Params.ContractDeployerAllowList != nil {
+		addresslist.ApplyGenesisAllocs(m.config.Chain.Genesis, contracts.AllowListContractsAddr,
+			m.config.Chain.Params.ContractDeployerAllowList)
+	}
+
+	// apply block list contracts deployer genesis data
+	if m.config.Chain.Params.ContractDeployerBlockList != nil {
+		addresslist.ApplyGenesisAllocs(m.config.Chain.Genesis, contracts.BlockListContractsAddr,
+			m.config.Chain.Params.ContractDeployerBlockList)
+	}
+
+	// apply transactions execution allow list genesis data
+	if m.config.Chain.Params.TransactionsAllowList != nil {
+		addresslist.ApplyGenesisAllocs(m.config.Chain.Genesis, contracts.AllowListTransactionsAddr,
+			m.config.Chain.Params.TransactionsAllowList)
+	}
+
+	// apply transactions execution block list genesis data
+	if m.config.Chain.Params.TransactionsBlockList != nil {
+		addresslist.ApplyGenesisAllocs(m.config.Chain.Genesis, contracts.BlockListTransactionsAddr,
+			m.config.Chain.Params.TransactionsBlockList)
+	}
+
+	// apply bridge allow list genesis data
+	if m.config.Chain.Params.BridgeAllowList != nil {
+		addresslist.ApplyGenesisAllocs(m.config.Chain.Genesis, contracts.AllowListBridgeAddr,
+			m.config.Chain.Params.BridgeAllowList)
+	}
+
+	// apply bridge block list genesis data
+	if m.config.Chain.Params.BridgeBlockList != nil {
+		addresslist.ApplyGenesisAllocs(m.config.Chain.Genesis, contracts.BlockListBridgeAddr,
+			m.config.Chain.Params.BridgeBlockList)
+	}
+
+	var initialStateRoot = types.ZeroHash
+
+	if ConsensusType(engineName) == PolyBFTConsensus {
+		polyBFTConfig, err := consensusPolyBFT.GetPolyBFTConfig(config.Chain)
+		if err != nil {
+			return nil, err
+		}
+
+		if polyBFTConfig.InitialTrieRoot != types.ZeroHash {
+			checkedInitialTrieRoot, err := itrie.HashChecker(polyBFTConfig.InitialTrieRoot.Bytes(), stateStorage)
+			if err != nil {
+				return nil, fmt.Errorf("error on state root verification %w", err)
+			}
+
+			if checkedInitialTrieRoot != polyBFTConfig.InitialTrieRoot {
+				return nil, errors.New("invalid initial state root")
+			}
+
+			logger.Info("Initial state root checked and correct")
+
+			initialStateRoot = polyBFTConfig.InitialTrieRoot
+		}
+	}
+
+	genesisRoot, err := m.executor.WriteGenesis(config.Chain.Genesis.Alloc, initialStateRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := initForkManager(engineName, config.Chain); err != nil {
+		return nil, err
+	}
+
 	// compute the genesis root state
-	genesisRoot := m.executor.WriteGenesis(config.Chain.Genesis.Alloc)
 	config.Chain.Genesis.StateRoot = genesisRoot
 
-	// use the eip155 signer
-	signer := crypto.NewEIP155Signer(uint64(m.config.Chain.Params.ChainID))
+	// Use the london signer with eip-155 as a fallback one
+	var signer crypto.TxSigner = crypto.NewLondonSigner(
+		uint64(m.config.Chain.Params.ChainID),
+		config.Chain.Params.Forks.IsActive(chain.Homestead, 0),
+		crypto.NewEIP155Signer(
+			uint64(m.config.Chain.Params.ChainID),
+			config.Chain.Params.Forks.IsActive(chain.Homestead, 0),
+		),
+	)
+
+	// create storage instance for blockchain
+	var db storage.Storage
+	{
+		if m.config.DataDir == "" {
+			db, err = memory.NewMemoryStorage(nil)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			db, err = leveldb.NewLevelDBStorage(
+				filepath.Join(m.config.DataDir, "blockchain"),
+				m.logger,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	// blockchain object
-	m.blockchain, err = blockchain.NewBlockchain(logger, m.config.DataDir, config.Chain, nil, m.executor, signer)
+	m.blockchain, err = blockchain.NewBlockchain(
+		logger,
+		db,
+		config.Chain,
+		nil,
+		m.executor,
+		signer,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// here we can provide some other configuration
+	m.gasHelper, err = gasprice.NewGasHelper(gasprice.DefaultGasHelperConfig, m.blockchain)
 	if err != nil {
 		return nil, err
 	}
@@ -207,23 +342,18 @@ func NewServer(config *Config) (*Server, error) {
 			Blockchain: m.blockchain,
 		}
 
-		deploymentWhitelist, err := configHelper.GetDeploymentWhitelist(config.Chain)
-		if err != nil {
-			return nil, err
-		}
-
 		// start transaction pool
 		m.txpool, err = txpool.NewTxPool(
 			logger,
-			m.chain.Params.Forks.At(0),
+			m.chain.Params.Forks,
 			hub,
 			m.grpcServer,
 			m.network,
 			&txpool.Config{
-				MaxSlots:            m.config.MaxSlots,
-				PriceLimit:          m.config.PriceLimit,
-				MaxAccountEnqueued:  m.config.MaxAccountEnqueued,
-				DeploymentWhitelist: deploymentWhitelist,
+				MaxSlots:           m.config.MaxSlots,
+				PriceLimit:         m.config.PriceLimit,
+				MaxAccountEnqueued: m.config.MaxAccountEnqueued,
+				ChainID:            big.NewInt(m.config.Chain.Params.ChainID),
 			},
 		)
 		if err != nil {
@@ -277,9 +407,24 @@ func NewServer(config *Config) (*Server, error) {
 		return nil, err
 	}
 
+	m.txpool.SetBaseFee(m.blockchain.Header())
 	m.txpool.Start()
 
 	return m, nil
+}
+
+func unaryInterceptor(
+	ctx context.Context,
+	req interface{},
+	_ *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler,
+) (interface{}, error) {
+	// Validate request
+	if err := validate.ValidateRequest(req); err != nil {
+		return nil, err
+	}
+
+	return handler(ctx, req)
 }
 
 func (s *Server) restoreChain() error {
@@ -400,24 +545,40 @@ func (s *Server) setupConsensus() error {
 		engineConfig = map[string]interface{}{}
 	}
 
+	var (
+		blockTime = common.Duration{Duration: 0}
+		err       error
+	)
+
+	if engineName != string(DummyConsensus) && engineName != string(DevConsensus) {
+		blockTime, err = extractBlockTime(engineConfig)
+		if err != nil {
+			return err
+		}
+	}
+
 	config := &consensus.Config{
-		Params: s.config.Chain.Params,
-		Config: engineConfig,
-		Path:   filepath.Join(s.config.DataDir, "consensus"),
+		Params:      s.config.Chain.Params,
+		Config:      engineConfig,
+		Path:        filepath.Join(s.config.DataDir, "consensus"),
+		IsRelayer:   s.config.Relayer,
+		RPCEndpoint: s.config.JSONRPC.JSONRPCAddr.String(),
 	}
 
 	consensus, err := engine(
 		&consensus.Params{
-			Context:        context.Background(),
-			Config:         config,
-			TxPool:         s.txpool,
-			Network:        s.network,
-			Blockchain:     s.blockchain,
-			Executor:       s.executor,
-			Grpc:           s.grpcServer,
-			Logger:         s.logger,
-			SecretsManager: s.secretsManager,
-			BlockTime:      s.config.BlockTime,
+			Context:               context.Background(),
+			Config:                config,
+			TxPool:                s.txpool,
+			Network:               s.network,
+			Blockchain:            s.blockchain,
+			Executor:              s.executor,
+			Grpc:                  s.grpcServer,
+			Logger:                s.logger,
+			SecretsManager:        s.secretsManager,
+			BlockTime:             uint64(blockTime.Seconds()),
+			NumBlockConfirmations: s.config.NumBlockConfirmations,
+			MetricsInterval:       s.config.MetricsInterval,
 		},
 	)
 
@@ -430,6 +591,32 @@ func (s *Server) setupConsensus() error {
 	return nil
 }
 
+// extractBlockTime extracts blockTime parameter from consensus engine configuration.
+// If it is missing or invalid, an appropriate error is returned.
+func extractBlockTime(engineConfig map[string]interface{}) (common.Duration, error) {
+	blockTimeGeneric, ok := engineConfig["blockTime"]
+	if !ok {
+		return common.Duration{}, errBlockTimeMissing
+	}
+
+	blockTimeRaw, err := json.Marshal(blockTimeGeneric)
+	if err != nil {
+		return common.Duration{}, errBlockTimeInvalid
+	}
+
+	var blockTime common.Duration
+
+	if err := json.Unmarshal(blockTimeRaw, &blockTime); err != nil {
+		return common.Duration{}, errBlockTimeInvalid
+	}
+
+	if blockTime.Seconds() < 1 {
+		return common.Duration{}, errBlockTimeInvalid
+	}
+
+	return blockTime, nil
+}
+
 type jsonRPCHub struct {
 	state              state.State
 	restoreProgression *progress.ProgressionWrapper
@@ -439,6 +626,8 @@ type jsonRPCHub struct {
 	*state.Executor
 	*network.Server
 	consensus.Consensus
+	consensus.BridgeDataProvider
+	gasprice.GasStore
 }
 
 func (j *jsonRPCHub) GetPeers() int {
@@ -497,6 +686,8 @@ func (j *jsonRPCHub) GetCode(root types.Hash, addr types.Address) ([]byte, error
 func (j *jsonRPCHub) ApplyTxn(
 	header *types.Header,
 	txn *types.Transaction,
+	override types.StateOverride,
+	nonPayable bool,
 ) (result *runtime.ExecutionResult, err error) {
 	blockCreator, err := j.GetConsensus().GetBlockCreator(header)
 	if err != nil {
@@ -507,6 +698,14 @@ func (j *jsonRPCHub) ApplyTxn(
 	if err != nil {
 		return
 	}
+
+	if override != nil {
+		if err = transition.WithStateOverride(override); err != nil {
+			return
+		}
+	}
+
+	transition.SetNonPayable(nonPayable)
 
 	result, err = transition.Apply(txn)
 
@@ -659,6 +858,8 @@ func (s *Server) setupJSONRPC() error {
 		Executor:           s.executor,
 		Consensus:          s.consensus,
 		Server:             s.network,
+		BridgeDataProvider: s.consensus.GetBridgeProvider(),
+		GasStore:           s.gasHelper,
 	}
 
 	conf := &jsonrpc.Config{
@@ -670,6 +871,8 @@ func (s *Server) setupJSONRPC() error {
 		PriceLimit:               s.config.PriceLimit,
 		BatchLengthLimit:         s.config.JSONRPC.BatchLengthLimit,
 		BlockRangeLimit:          s.config.JSONRPC.BlockRangeLimit,
+		ConcurrentRequestsDebug:  s.config.JSONRPC.ConcurrentRequestsDebug,
+		WebSocketReadLimit:       s.config.JSONRPC.WebSocketReadLimit,
 	}
 
 	srv, err := jsonrpc.NewJSONRPC(s.logger, conf)
@@ -691,6 +894,7 @@ func (s *Server) setupGRPC() error {
 		return err
 	}
 
+	// Start server with infinite retries
 	go func() {
 		if err := s.grpcServer.Serve(lis); err != nil {
 			s.logger.Error(err.Error())
@@ -740,10 +944,10 @@ func (s *Server) Close() {
 		}
 	}
 
-	// close the txpool's main loop
+	// Close the txpool's main loop
 	s.txpool.Close()
 
-	// close DataDog profiler
+	// Close DataDog profiler
 	s.closeDataDogProfiler()
 }
 
@@ -765,13 +969,74 @@ func (s *Server) startPrometheusServer(listenAddr *net.TCPAddr) *http.Server {
 		ReadHeaderTimeout: 60 * time.Second,
 	}
 
-	go func() {
-		s.logger.Info("Prometheus server started", "addr=", listenAddr.String())
+	s.logger.Info("Prometheus server started", "addr=", listenAddr.String())
 
-		if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			s.logger.Error("Prometheus HTTP server ListenAndServe", "err", err)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			if !errors.Is(err, http.ErrServerClosed) {
+				s.logger.Error("Prometheus HTTP server ListenAndServe", "err", err)
+			}
 		}
 	}()
 
 	return srv
+}
+
+func initForkManager(engineName string, config *chain.Chain) error {
+	var initialParams *forkmanager.ForkParams
+
+	if factory := forkManagerInitialParamsFactory[ConsensusType(engineName)]; factory != nil {
+		params, err := factory(config)
+		if err != nil {
+			return err
+		}
+
+		initialParams = params
+	}
+
+	fm := forkmanager.GetInstance()
+
+	// clear everything in forkmanager (if there was something because of tests) and register initial fork
+	fm.Clear()
+	fm.RegisterFork(forkmanager.InitialFork, initialParams)
+
+	// Register forks
+	for name, f := range *config.Params.Forks {
+		// check if fork is not supported by current edge version
+		if _, found := (*chain.AllForksEnabled)[name]; !found {
+			return fmt.Errorf("fork is not available: %s", name)
+		}
+
+		fm.RegisterFork(name, f.Params)
+	}
+
+	// Register handlers and additional forks here
+	if err := types.RegisterTxHashFork(chain.TxHashWithType); err != nil {
+		return err
+	}
+
+	// Register Handler for London fork fix
+	if err := state.RegisterLondonFixFork(chain.LondonFix); err != nil {
+		return err
+	}
+
+	if factory := forkManagerFactory[ConsensusType(engineName)]; factory != nil {
+		if err := factory(config.Params.Forks); err != nil {
+			return err
+		}
+	}
+
+	// Activate initial fork
+	if err := fm.ActivateFork(forkmanager.InitialFork, uint64(0)); err != nil {
+		return err
+	}
+
+	// Activate forks
+	for name, f := range *config.Params.Forks {
+		if err := fm.ActivateFork(name, f.Block); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

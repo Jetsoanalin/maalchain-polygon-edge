@@ -91,12 +91,14 @@ func getTestExtraBytes(
 	proposerSeal []byte,
 	committedSeals Seals,
 	parentCommittedSeals Seals,
+	roundNumber *uint64,
 ) []byte {
 	extra := &IstanbulExtra{
 		Validators:           validators,
 		ProposerSeal:         proposerSeal,
 		CommittedSeals:       committedSeals,
 		ParentCommittedSeals: parentCommittedSeals,
+		RoundNumber:          roundNumber,
 	}
 
 	return append(
@@ -214,6 +216,7 @@ func TestSignerInitIBFTExtra(t *testing.T) {
 				[]byte{},
 				test.committedSeals,
 				test.parentCommittedSeals,
+				nil,
 			)
 
 			assert.Equal(
@@ -255,6 +258,7 @@ func TestSignerGetIBFTExtra(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					nil,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -284,6 +288,7 @@ func TestSignerGetIBFTExtra(t *testing.T) {
 					blsValidators,
 					testProposerSeal,
 					testAggregatedSeals1,
+					nil,
 					nil,
 				),
 			},
@@ -315,6 +320,7 @@ func TestSignerGetIBFTExtra(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					testSerializedSeals2,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -349,6 +355,7 @@ func TestSignerGetIBFTExtra(t *testing.T) {
 					testProposerSeal,
 					testAggregatedSeals1,
 					testAggregatedSeals2,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -383,6 +390,7 @@ func TestSignerGetIBFTExtra(t *testing.T) {
 					testProposerSeal,
 					testAggregatedSeals1,
 					testSerializedSeals1,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -417,6 +425,7 @@ func TestSignerGetIBFTExtra(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					testAggregatedSeals1,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -503,6 +512,7 @@ func TestSignerWriteProposerSeal(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					nil,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -531,6 +541,7 @@ func TestSignerWriteProposerSeal(t *testing.T) {
 					nil,
 					testSerializedSeals1,
 					nil,
+					nil,
 				),
 			},
 			signer: NewSigner(
@@ -553,6 +564,7 @@ func TestSignerWriteProposerSeal(t *testing.T) {
 					ecdsaValidators,
 					testProposerSeal,
 					testSerializedSeals1,
+					nil,
 					nil,
 				),
 			},
@@ -621,6 +633,7 @@ func TestSignerEcrecoverFromHeader(t *testing.T) {
 					ecdsaValidators,
 					testProposerSeal,
 					testSerializedSeals1,
+					nil,
 					nil,
 				),
 			},
@@ -724,11 +737,12 @@ func TestVerifyCommittedSeal(t *testing.T) {
 }
 
 func TestSignerWriteCommittedSeals(t *testing.T) {
-	t.Parallel()
+	var round0 uint64 = 0
 
 	tests := []struct {
 		name           string
 		header         *types.Header
+		roundNumber    uint64
 		sealMap        map[types.Address][]byte
 		keyManager     *MockKeyManager
 		expectedHeader *types.Header
@@ -737,14 +751,16 @@ func TestSignerWriteCommittedSeals(t *testing.T) {
 		{
 			name:           "should return ErrEmptyCommittedSeals if sealMap is empty",
 			header:         &types.Header{},
+			roundNumber:    0,
 			sealMap:        map[types.Address][]byte{},
 			keyManager:     nil,
 			expectedHeader: nil,
 			expectedErr:    ErrEmptyCommittedSeals,
 		},
 		{
-			name:   "should return error if GetValidators fails",
-			header: &types.Header{},
+			name:        "should return error if GetValidators fails",
+			header:      &types.Header{},
+			roundNumber: 0,
 			sealMap: map[types.Address][]byte{
 				testAddr1: []byte("test"),
 			},
@@ -765,8 +781,10 @@ func TestSignerWriteCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					&SerializedSeal{},
 					nil,
+					nil,
 				),
 			},
+			roundNumber: 0,
 			sealMap: map[types.Address][]byte{
 				testAddr1: []byte("test"),
 			},
@@ -793,8 +811,10 @@ func TestSignerWriteCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					&SerializedSeal{},
 					nil,
+					nil,
 				),
 			},
+			roundNumber: 0,
 			sealMap: map[types.Address][]byte{
 				testAddr1: []byte("test"),
 			},
@@ -816,6 +836,7 @@ func TestSignerWriteCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					nil,
+					&round0,
 				),
 			},
 			expectedErr: nil,
@@ -826,11 +847,9 @@ func TestSignerWriteCommittedSeals(t *testing.T) {
 		test := test
 
 		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-
 			signer := newTestSingleKeyManagerSigner(test.keyManager)
 
-			header, err := signer.WriteCommittedSeals(test.header, test.sealMap)
+			header, err := signer.WriteCommittedSeals(test.header, test.roundNumber, test.sealMap)
 
 			testHelper.AssertErrorMessageContains(
 				t,
@@ -847,6 +866,8 @@ func TestSignerWriteCommittedSeals(t *testing.T) {
 }
 
 func TestSignerVerifyCommittedSeals(t *testing.T) {
+	committedSeals := &SerializedSeal{}
+
 	tests := []struct {
 		name                    string
 		header                  *types.Header
@@ -857,19 +878,6 @@ func TestSignerVerifyCommittedSeals(t *testing.T) {
 		expectedErr             error
 	}{
 		{
-			name:                    "should return error if GetIBFTExtra fails",
-			header:                  &types.Header{},
-			validators:              ecdsaValidators,
-			quorumSize:              0,
-			verifyCommittedSealsRes: 0,
-			verifyCommittedSealsErr: nil,
-			expectedErr: fmt.Errorf(
-				"wrong extra size, expected greater than or equal to %d but actual %d",
-				IstanbulExtraVanity,
-				0,
-			),
-		},
-		{
 			name: "should return error if VerifyCommittedSeals fails",
 			header: &types.Header{
 				Number: 1,
@@ -877,6 +885,7 @@ func TestSignerVerifyCommittedSeals(t *testing.T) {
 					ecdsaValidators,
 					testProposerSeal,
 					testSerializedSeals1,
+					nil,
 					nil,
 				),
 			},
@@ -895,6 +904,7 @@ func TestSignerVerifyCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					nil,
+					nil,
 				),
 			},
 			validators:              ecdsaValidators,
@@ -911,6 +921,7 @@ func TestSignerVerifyCommittedSeals(t *testing.T) {
 					ecdsaValidators,
 					testProposerSeal,
 					testSerializedSeals1,
+					nil,
 					nil,
 				),
 			},
@@ -931,7 +942,7 @@ func TestSignerVerifyCommittedSeals(t *testing.T) {
 					return test.validators
 				},
 				NewEmptyCommittedSealsFunc: func() Seals {
-					return &SerializedSeal{}
+					return committedSeals
 				},
 				VerifyCommittedSealsFunc: func(s Seals, b []byte, v validators.Validators) (int, error) {
 					assert.Equal(t, testSerializedSeals1, s)
@@ -953,7 +964,12 @@ func TestSignerVerifyCommittedSeals(t *testing.T) {
 			testHelper.AssertErrorMessageContains(
 				t,
 				test.expectedErr,
-				signer.VerifyCommittedSeals(test.header, test.validators, test.quorumSize),
+				signer.VerifyCommittedSeals(
+					test.header.Hash,
+					committedSeals,
+					test.validators,
+					test.quorumSize,
+				),
 			)
 		})
 	}
@@ -1005,6 +1021,7 @@ func TestSignerVerifyParentCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					nil,
+					nil,
 				),
 			},
 			parentValidators:        ecdsaValidators,
@@ -1024,6 +1041,7 @@ func TestSignerVerifyParentCommittedSeals(t *testing.T) {
 					ecdsaValidators,
 					testProposerSeal,
 					testSerializedSeals1,
+					nil,
 					nil,
 				),
 			},
@@ -1045,6 +1063,7 @@ func TestSignerVerifyParentCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					testSerializedSeals2,
+					nil,
 				),
 			},
 			parentValidators:        ecdsaValidators,
@@ -1065,6 +1084,7 @@ func TestSignerVerifyParentCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					testSerializedSeals2,
+					nil,
 				),
 			},
 			parentValidators:        ecdsaValidators,
@@ -1085,6 +1105,7 @@ func TestSignerVerifyParentCommittedSeals(t *testing.T) {
 					testProposerSeal,
 					testSerializedSeals1,
 					testSerializedSeals2,
+					nil,
 				),
 			},
 			parentValidators:        ecdsaValidators,
@@ -1128,7 +1149,7 @@ func TestSignerVerifyParentCommittedSeals(t *testing.T) {
 				t,
 				test.expectedErr,
 				signer.VerifyParentCommittedSeals(
-					test.parentHeader,
+					test.parentHeader.Hash,
 					test.header,
 					test.parentValidators,
 					test.quorumSize,
