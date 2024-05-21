@@ -2,3 +2,5 @@
 NodeNew.pem
 secret.txt
 .txt
+.env
+secret.env
